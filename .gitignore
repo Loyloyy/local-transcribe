@@ -1,0 +1,19 @@
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Runtime files
+voice-type.log
+voice-type.instance.lock
+voice-type.heartbeat
+settings.json
+
+# Environment
+.env

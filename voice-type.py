@@ -1,0 +1,2251 @@
+"""
+voice-type.py — Push-to-talk voice typing tool.
+
+Hold CAPS LOCK while speaking. Partial transcription appears in the overlay
+as you talk. Release to paste the final text into the active window.
+
+A microphone icon lives in the system tray; right-click for settings and exit.
+
+Requirements: faster-whisper, sounddevice, numpy, Pillow, pystray,
+huggingface_hub
+"""
+
+import os
+import sys
+import time
+import math
+import json
+import signal
+import subprocess
+import threading
+import queue
+import tkinter as tk
+from tkinter import messagebox
+from tkinter import scrolledtext
+from tkinter import ttk
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+# ---------------------------------------------------------------------------
+# Platform abstraction
+# ---------------------------------------------------------------------------
+
+import platform_win as platform  # type: ignore[import]
+
+platform.setup_dll_paths()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+_LOG_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice-type.log")
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_INSTANCE_LOCK_PATH = os.path.join(_SCRIPT_DIR, "voice-type.instance.lock")
+_HEARTBEAT_PATH = os.path.join(_SCRIPT_DIR, "voice-type.heartbeat")
+_HEARTBEAT_INTERVAL = 0.5       # how often the hotkey loop refreshes the heartbeat
+_HEARTBEAT_STALE_SECONDS = 10   # older than this => the running instance is wedged
+_LOG_MAX_MB  = 1       # rotate when log exceeds this size
+_LOG_KEEP    = 200     # lines to keep after rotation
+
+
+_instance_lock_file = None
+
+
+def _write_heartbeat() -> None:
+    """Refresh the heartbeat file's mtime so other instances can tell we're alive."""
+    try:
+        with open(_HEARTBEAT_PATH, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _heartbeat_age() -> float | None:
+    """Seconds since the running instance last refreshed its heartbeat, or None."""
+    try:
+        return time.time() - os.path.getmtime(_HEARTBEAT_PATH)
+    except OSError:
+        return None
+
+
+def _flock_nb(lock_file) -> bool:
+    """Try to grab the instance lock without blocking. True on success."""
+    import msvcrt
+    lock_file.seek(0)
+    try:
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _read_lock_pid(lock_file) -> int | None:
+    try:
+        lock_file.seek(0)
+        return int((lock_file.read() or "").strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _acquire_single_instance_lock() -> bool:
+    global _instance_lock_file
+    lock_file = open(_INSTANCE_LOCK_PATH, "a+", encoding="utf-8")
+    try:
+        if not _flock_nb(lock_file):
+            lock_file.close()
+            return False
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        _instance_lock_file = lock_file
+        _write_heartbeat()
+        return True
+    except Exception:
+        lock_file.close()
+        raise
+
+
+if not _acquire_single_instance_lock():
+    print("voice-type is already running; exiting duplicate instance.", flush=True)
+    sys.exit(0)
+
+
+def _rotate_log():
+    """On startup: if log > _LOG_MAX_MB, keep only the last _LOG_KEEP lines."""
+    try:
+        if not os.path.exists(_LOG_PATH):
+            return
+        if os.path.getsize(_LOG_PATH) < _LOG_MAX_MB * 1024 * 1024:
+            return
+        with open(_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        kept = lines[-_LOG_KEEP:]
+        with open(_LOG_PATH, "w", encoding="utf-8") as f:
+            f.write(f"[log rotated — kept last {_LOG_KEEP} of {len(lines)} lines]\n")
+            f.writelines(kept)
+    except Exception:
+        pass  # never crash on log housekeeping
+
+_rotate_log()
+_log_lock   = threading.Lock()
+_log_file   = open(_LOG_PATH, "a", encoding="utf-8", buffering=1)
+
+
+def log(msg: str):
+    ts = time.strftime("%H:%M:%S")
+    line = f"{ts}  {msg}"
+    with _log_lock:
+        _log_file.write(line + "\n")
+        _log_file.flush()
+    print(line, flush=True)
+
+
+log(f"=== voice-type started === log: {_LOG_PATH}")
+
+import numpy as np
+import sounddevice as sd
+from faster_whisper import WhisperModel
+from runtime_policy import should_keep_mic_stream_open_local
+from speech_backends import MlxWhisperModel, resolve_local_mlx_repo
+from text_formatter import (
+    DEFAULT_FORMATTER_MODEL,
+    DEFAULT_FORMATTER_SYSTEM_PROMPT,
+    FORMATTER_MODEL_PRESETS,
+    LlamaCppFormatter,
+    format_for_injection as format_text_for_injection,
+    resolve_system_prompt,
+)
+from preview_format import wrap_preview
+from voice_type_control import ControlServer
+from meeting_mode import MeetingRecorder, find_loopback_device
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+POLL_INTERVAL    = 0.01   # key-state poll rate (100 Hz)
+MAX_RECORDING_SECONDS = 120  # safety cap: force-stop if the hotkey appears stuck down
+STREAM_CLOSE_TIMEOUT  = 2.0  # give up on a stream stop/close if it deadlocks
+STREAM_INTERVAL  = 0.5    # seconds between streaming preview passes
+STREAM_MIN_AUDIO = 0.8    # don't start streaming until this many seconds recorded
+PRECOMP_MIN_AUDIO = 2.5   # only precompute once enough audio has accumulated
+PRECOMP_MIN_DELTA = 0.8   # minimum new audio before launching another pass
+PRECOMP_OVERLAP = 1.2     # seconds of overlap to stitch base+tail safely
+PRECOMP_IDLE_SLEEP = 0.08 # small backoff while waiting for enough new audio
+PRECOMP_STOP_WAIT = 0.75  # wait briefly for in-flight pass to finish on key-up
+FORMATTER_TIMEOUT = 6.0   # soft timeout for local text cleanup
+
+# Final transcription model (accurate):
+#   CPU → "small.en"        ~0.5–1.5s depending on clip length
+#   GPU → "large-v3-turbo"  ~0.2s on CUDA
+GPU_MODEL    = "large-v3-turbo"
+CPU_MODEL    = "small.en"
+
+# Streaming preview model (speed over accuracy — visual feedback only):
+# tiny.en runs in ~0.1s on CPU so it never meaningfully blocks the final pass.
+STREAM_MODEL = "tiny.en"
+
+SAMPLE_RATE  = 16000
+CHANNELS     = 1
+DTYPE        = "float32"
+DEVICE       = None       # None = system default mic
+COMPUTE_TYPE = "float16"  # float16 on GPU; overridden to int8 on CPU
+
+# Models available in the tray settings menu.
+# Final model: accuracy matters most; stream model: speed matters most.
+FINAL_MODEL_OPTIONS  = ["tiny.en", "base.en", "small.en", "medium.en",
+                        "large-v2", "large-v3", "large-v3-turbo"]
+STREAM_MODEL_OPTIONS = ["tiny.en", "base.en", "small.en"]
+
+MODEL_LABELS = {
+    "tiny.en":          "Whisper: tiny",
+    "base.en":          "Whisper: base",
+    "small.en":         "Whisper: small",
+    "medium.en":        "Whisper: medium",
+    "large-v2":         "Whisper: large-v2",
+    "large-v3":         "Whisper: large-v3",
+    "large-v3-turbo":   "Whisper: large-v3-turbo",
+}
+OUTPUT_MODE_OPTIONS  = ["final_only", "hybrid", "stabilized", "precompute"]
+FORMATTER_MODEL_OPTIONS = list(FORMATTER_MODEL_PRESETS.keys())
+
+# ---------------------------------------------------------------------------
+# Settings (persisted to settings.json beside the script)
+# ---------------------------------------------------------------------------
+
+_SETTINGS_PATH = os.path.join(_SCRIPT_DIR, "settings.json")
+_settings: dict = {}
+
+
+def _load_settings():
+    """Load settings.json, filling missing keys with hardware-appropriate defaults."""
+    global _settings
+    if os.path.exists(_SETTINGS_PATH):
+        try:
+            with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                _settings = json.load(f)
+        except Exception as e:
+            log(f"Settings load failed: {e}; using defaults.")
+            _settings = {}
+    # Defaults are resolved after CUDA detection so the right model is chosen.
+    cuda = platform.cuda_available()
+    _settings.setdefault("final_model",  GPU_MODEL if cuda else CPU_MODEL)
+    _settings.setdefault("stream_model", GPU_MODEL if cuda else STREAM_MODEL)
+    _settings.setdefault("output_mode",  "final_only")
+    _settings.setdefault("formatter_enabled", False)
+    _settings.setdefault("formatter_model", DEFAULT_FORMATTER_MODEL)
+    _settings.setdefault("formatter_system_prompt", DEFAULT_FORMATTER_SYSTEM_PROMPT)
+    _settings.setdefault("language", "en")
+    if _settings.get("formatter_model") not in FORMATTER_MODEL_PRESETS:
+        _settings["formatter_model"] = DEFAULT_FORMATTER_MODEL
+    # User-editable word/phrase corrections applied after every transcription.
+    _settings.setdefault("task", "transcribe")  # "transcribe" or "translate"
+    _settings.setdefault("audio_source", "mic")  # "mic" or "loopback"
+    _settings.setdefault("corrections", {
+        "Q DA": "CUDA",
+        "Kuda": "CUDA",
+    })
+    _save_settings()
+
+
+def _save_settings():
+    try:
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(_settings, f, indent=2)
+    except Exception as e:
+        log(f"Settings save failed: {e}")
+
+
+# Windows-only: path to the VBS silent launcher (used by startup registration).
+_VBS_PATH = os.path.join(_SCRIPT_DIR, "voice-type.vbs")
+
+_OUTPUT_MODE_LABELS = {
+    "final_only": "Final Only (quality)",
+    "hybrid": "Hybrid (live overlay)",
+    "stabilized": "Stabilized (faster output)",
+    "precompute": "Precompute (faster finalize)",
+}
+
+
+# ---------------------------------------------------------------------------
+# Models
+#
+# Two separate instances so streaming never contends with final transcription:
+#   _stream_model  tiny.en   CPU int8  ~0.1s/pass  — live preview only
+#   _model         small.en  CPU int8  ~0.5–1.5s   — accurate final result
+#                  (large-v3-turbo on CUDA for both)
+# ---------------------------------------------------------------------------
+
+import re
+
+# Strip the most common English speech disfluencies.
+_FILLER_RE = re.compile(
+    r'\b(uh+|um+|er+|ah+|hmm+|hm+|mhm|erm)\b[,.]?',
+    re.IGNORECASE,
+)
+
+def _clean_filler(text: str) -> str:
+    cleaned = _FILLER_RE.sub('', text)
+    return ' '.join(cleaned.split())
+
+
+def _apply_corrections(text: str) -> str:
+    """Apply user-defined word/phrase corrections from settings.json."""
+    corrections: dict = _settings.get("corrections", {})
+    for wrong, right in corrections.items():
+        pattern = re.compile(r'(?<!\w)' + re.escape(wrong) + r'(?!\w)', re.IGNORECASE)
+        text = pattern.sub(right, text)
+    return text
+
+
+_model = None
+_model_lock = threading.Lock()
+
+
+def _load_faster_whisper_model(name: str):
+    cuda = platform.cuda_available()
+    device = "cuda" if cuda else "cpu"
+    ct = COMPUTE_TYPE if cuda else "int8"
+    log(f"Loading final model {name!r} on {device} ({ct})...")
+    return WhisperModel(name, device=device, compute_type=ct)
+
+
+def get_model():
+    global _model
+    if _model is None:
+        with _model_lock:
+            if _model is None:
+                name = _settings.get("final_model", CPU_MODEL)
+
+                mlx_repo = resolve_local_mlx_repo(model_name=name)
+                if mlx_repo:
+                    try:
+                        log(f"Loading final model {name!r} on mlx ({mlx_repo})...")
+                        mlx_model = MlxWhisperModel(repo_id=mlx_repo)
+                        mlx_model.warm()
+                        _model = mlx_model
+                        log("Final model ready.")
+                        return _model
+                    except Exception as e:
+                        log(f"MLX load failed for {name!r}: {e}. Falling back to faster-whisper.")
+
+                _model = _load_faster_whisper_model(name)
+                log("Final model ready.")
+    return _model
+
+
+_stream_model: WhisperModel | None = None
+_stream_model_lock = threading.Lock()
+
+
+def get_stream_model() -> WhisperModel | None:
+    """Returns the streaming preview model, or None if not yet loaded."""
+    return _stream_model
+
+
+def _load_stream_model():
+    """Load the stream model in the background. Waits for the final model first
+    to avoid competing for CPU during initial warm-up."""
+    global _stream_model
+    get_model()   # ensure final model finishes first
+    with _stream_model_lock:
+        if _stream_model is None:
+            cuda   = platform.cuda_available()
+            name   = _settings.get("stream_model", STREAM_MODEL)
+            device = "cuda" if cuda else "cpu"
+            ct     = COMPUTE_TYPE if cuda else "int8"
+            log(f"Loading stream model {name!r} on {device} ({ct})...")
+            _stream_model = WhisperModel(name, device=device, compute_type=ct)
+            log("Stream model ready.")
+
+
+_text_formatter: LlamaCppFormatter | None = None
+_text_formatter_lock = threading.Lock()
+
+
+def get_text_formatter() -> LlamaCppFormatter | None:
+    global _text_formatter
+    if not _settings.get("formatter_enabled", False):
+        return None
+    model_key = _settings.get("formatter_model", DEFAULT_FORMATTER_MODEL)
+    system_prompt = resolve_system_prompt(_settings.get("formatter_system_prompt"))
+    if model_key not in FORMATTER_MODEL_PRESETS:
+        model_key = DEFAULT_FORMATTER_MODEL
+    needs_reload = (
+        _text_formatter is None
+        or _text_formatter.model_key != model_key
+        or _text_formatter.system_prompt != system_prompt
+    )
+    if needs_reload:
+        with _text_formatter_lock:
+            needs_reload = (
+                _text_formatter is None
+                or _text_formatter.model_key != model_key
+                or _text_formatter.system_prompt != system_prompt
+            )
+            if needs_reload:
+                try:
+                    _text_formatter = LlamaCppFormatter(
+                        model_key,
+                        logger=log,
+                        system_prompt=system_prompt,
+                    )
+                    _text_formatter.warm()
+                    log(f"Formatter model ready: {_text_formatter.describe()}")
+                except Exception:
+                    _text_formatter = None
+                    raise
+    return _text_formatter
+
+
+def _set_final_model(name: str):
+    """Switch the final transcription model; reloads it in the background."""
+    global _model
+    if _settings.get("final_model") == name:
+        return
+    log(f"Final model switching to {name!r}...")
+    _settings["final_model"] = name
+    _save_settings()
+    with _model_lock:
+        _model = None
+    threading.Thread(target=get_model, daemon=True).start()
+
+
+def _set_stream_model(name: str):
+    """Switch the streaming preview model; reloads it in the background."""
+    global _stream_model
+    if _settings.get("stream_model") == name:
+        return
+    log(f"Stream model switching to {name!r}...")
+    _settings["stream_model"] = name
+    _save_settings()
+    with _stream_model_lock:
+        _stream_model = None
+    threading.Thread(target=_load_stream_model, daemon=True).start()
+
+
+def _set_output_mode(name: str):
+    """Switch the finalize output mode; persists immediately."""
+    if _settings.get("output_mode") == name:
+        return
+    log(f"Output mode switching to {name!r}...")
+    _settings["output_mode"] = name
+    _save_settings()
+
+
+def _set_formatter_enabled(enabled: bool):
+    enabled = bool(enabled)
+    if bool(_settings.get("formatter_enabled", False)) == enabled:
+        return
+    log(f"Formatter {'enabled' if enabled else 'disabled'}.")
+    _settings["formatter_enabled"] = enabled
+    _save_settings()
+    if enabled:
+        threading.Thread(target=get_text_formatter, daemon=True).start()
+
+
+def _set_formatter_model(name: str):
+    global _text_formatter
+    if name not in FORMATTER_MODEL_PRESETS:
+        return
+    if _settings.get("formatter_model") == name:
+        return
+    log(f"Formatter model switching to {name!r}...")
+    _settings["formatter_model"] = name
+    _save_settings()
+    with _text_formatter_lock:
+        _text_formatter = None
+    if _settings.get("formatter_enabled", False):
+        threading.Thread(target=get_text_formatter, daemon=True).start()
+
+
+def _set_formatter_system_prompt(prompt: str):
+    global _text_formatter
+    prompt = resolve_system_prompt(prompt)
+    if _settings.get("formatter_system_prompt") == prompt:
+        return
+    log("Formatter system prompt updated.")
+    _settings["formatter_system_prompt"] = prompt
+    _save_settings()
+    with _text_formatter_lock:
+        _text_formatter = None
+    if _settings.get("formatter_enabled", False):
+        threading.Thread(target=get_text_formatter, daemon=True).start()
+
+
+def _set_audio_source(source: str):
+    if _settings.get("audio_source") == source:
+        return
+    log(f"Audio source switching to {source!r}...")
+    _settings["audio_source"] = source
+    _save_settings()
+
+
+def _set_language(code: str | None):
+    """Switch transcription language; None means auto-detect."""
+    if _settings.get("language") == code:
+        return
+    log(f"Language switching to {code!r}...")
+    _settings["language"] = code
+    _save_settings()
+
+
+def _set_task(task: str):
+    if _settings.get("task") == task:
+        return
+    log(f"Task switching to {task!r}...")
+    _settings["task"] = task
+    _save_settings()
+
+
+def _effective_output_mode() -> str:
+    return _settings.get("output_mode", "final_only")
+
+
+def _maybe_format_final_text(text: str, mode: str) -> str:
+    enabled = bool(_settings.get("formatter_enabled", False))
+    started = time.perf_counter()
+    formatter = None
+    if enabled:
+        try:
+            formatter = get_text_formatter()
+        except Exception as e:
+            log(f"Formatter unavailable: {e}")
+            formatter = None
+    result = format_text_for_injection(
+        text,
+        enabled=enabled,
+        mode=mode,
+        formatter=formatter,
+        timeout_sec=FORMATTER_TIMEOUT,
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if enabled:
+        if result.used_formatter:
+            log(f"Formatter accepted [{mode}] in {elapsed_ms:.0f} ms: {result.reason}")
+        else:
+            log(f"Formatter skipped [{mode}] in {elapsed_ms:.0f} ms: {result.reason}")
+    return result.text
+
+
+# ---------------------------------------------------------------------------
+# Tray icon drawing (Pillow)
+# ---------------------------------------------------------------------------
+
+_TRAY_COLORS = {
+    "idle":       (72,  72,  82),
+    "recording":  (192, 57,  43),
+    "processing": (211, 84,   0),
+    "disabled":   (38,  38,  42),
+}
+
+_TRAY_LABELS = {
+    "idle":       "Voice Type — Ready",
+    "recording":  "Voice Type — Recording…",
+    "processing": "Voice Type — Transcribing…",
+    "disabled":   "Voice Type — Disabled",
+}
+
+
+def _make_tray_icon(state: str):
+    from PIL import Image, ImageDraw
+
+    fg   = _TRAY_COLORS.get(state, _TRAY_COLORS["idle"])
+    size = 64
+    img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d    = ImageDraw.Draw(img)
+    cx   = size // 2
+
+    # Coloured background circle
+    d.ellipse([1, 1, size - 2, size - 2], fill=(*fg, 255))
+
+    # Microphone body (white capsule)
+    wh = (255, 255, 255, 230)
+    bw, bh, radius = 16, 22, 8
+    bx0, by0 = cx - bw // 2, 9
+    bx1, by1 = cx + bw // 2, by0 + bh
+    try:
+        d.rounded_rectangle([bx0, by0, bx1, by1], radius=radius, fill=wh)
+    except AttributeError:
+        # Pillow < 8.2 fallback
+        d.rectangle([bx0 + radius, by0, bx1 - radius, by1], fill=wh)
+        d.rectangle([bx0, by0 + radius, bx1, by1 - radius], fill=wh)
+        for ex, ey in [(bx0, by0), (bx1 - 2*radius, by0),
+                       (bx0, by1 - 2*radius), (bx1 - 2*radius, by1 - 2*radius)]:
+            d.ellipse([ex, ey, ex + 2*radius, ey + 2*radius], fill=wh)
+
+    # Stand arc
+    d.arc([cx - 15, by1 - 3, cx + 15, by1 + 13], start=0, end=180, fill=wh, width=3)
+    # Stem
+    d.line([cx, by1 + 10, cx, by1 + 15], fill=wh, width=3)
+    # Base
+    d.line([cx - 9, by1 + 15, cx + 9, by1 + 15], fill=wh, width=3)
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Language support
+# ---------------------------------------------------------------------------
+
+LANGUAGE_OPTIONS = {
+    "en": "English",
+    "zh": "Mandarin",
+    "ms": "Malay",
+    "ja": "Japanese",
+    None: "Auto-detect",
+}
+
+
+# ---------------------------------------------------------------------------
+# Meeting mode state (initialized in run())
+# ---------------------------------------------------------------------------
+
+_meeting_recorder: MeetingRecorder | None = None
+
+
+# ---------------------------------------------------------------------------
+# System tray icon (pystray — runs in its own background thread)
+# ---------------------------------------------------------------------------
+
+class TrayIcon:
+    def __init__(self, overlay: "Overlay"):
+        self._overlay = overlay
+        self.enabled  = True         # read/written by hotkey thread & tray thread
+        self._icon    = None
+
+    def start(self):
+        import pystray
+
+        def _make_final_action(name):
+            return lambda: _set_final_model(name)
+
+        def _make_final_check(name):
+            return lambda item: _settings.get("final_model") == name
+
+        def _make_stream_action(name):
+            return lambda: _set_stream_model(name)
+
+        def _make_stream_check(name):
+            return lambda item: _settings.get("stream_model") == name
+
+        def _final_model_items():
+            return [
+                pystray.MenuItem(
+                    MODEL_LABELS.get(m, m),
+                    _make_final_action(m),
+                    checked=_make_final_check(m),
+                    radio=True,
+                )
+                for m in FINAL_MODEL_OPTIONS
+            ]
+
+        def _stream_model_items():
+            return [
+                pystray.MenuItem(
+                    MODEL_LABELS.get(m, m),
+                    _make_stream_action(m),
+                    checked=_make_stream_check(m),
+                    radio=True,
+                )
+                for m in STREAM_MODEL_OPTIONS
+            ]
+
+        _OUTPUT_MODE_LABELS = {
+            "final_only":  "Final Only (quality)",
+            "hybrid":      "Hybrid (live overlay)",
+            "stabilized":  "Stabilized (faster output)",
+            "precompute":  "Precompute (faster finalize)",
+        }
+
+        def _make_output_mode_action(name):
+            return lambda: _set_output_mode(name)
+
+        def _make_output_mode_check(name):
+            return lambda item: _settings.get("output_mode") == name
+
+        def _output_mode_items():
+            return [
+                pystray.MenuItem(
+                    _OUTPUT_MODE_LABELS.get(m, m),
+                    _make_output_mode_action(m),
+                    checked=_make_output_mode_check(m),
+                    radio=True,
+                )
+                for m in OUTPUT_MODE_OPTIONS
+            ]
+
+        def _make_formatter_model_action(name):
+            return lambda: _set_formatter_model(name)
+
+        def _make_formatter_model_check(name):
+            return lambda item: _settings.get("formatter_model") == name
+
+        def _formatter_model_items():
+            return [
+                pystray.MenuItem(
+                    FORMATTER_MODEL_PRESETS[m].label,
+                    _make_formatter_model_action(m),
+                    checked=_make_formatter_model_check(m),
+                    radio=True,
+                )
+                for m in FORMATTER_MODEL_OPTIONS
+            ]
+
+        def _formatter_section_items():
+            items = []
+            if _settings.get("formatter_enabled", False):
+                items.append(pystray.MenuItem("Model", pystray.Menu(lambda: _formatter_model_items())))
+            items.append(pystray.MenuItem("Edit System Prompt...", self._edit_formatter_prompt))
+            items.append(pystray.MenuItem("Reset System Prompt", self._reset_formatter_prompt))
+            return items
+
+        _AUDIO_SOURCE_OPTIONS = {
+            "mic": "Microphone",
+            "loopback": "System Audio (loopback)",
+        }
+
+        def _make_audio_source_action(source):
+            return lambda: _set_audio_source(source)
+
+        def _make_audio_source_check(source):
+            return lambda item: _settings.get("audio_source", "mic") == source
+
+        def _audio_source_items():
+            return [
+                pystray.MenuItem(
+                    label,
+                    _make_audio_source_action(source),
+                    checked=_make_audio_source_check(source),
+                    radio=True,
+                )
+                for source, label in _AUDIO_SOURCE_OPTIONS.items()
+            ]
+
+        _TASK_OPTIONS = {
+            "transcribe": "Transcribe",
+            "translate": "Translate to English",
+        }
+
+        def _make_task_action(task):
+            return lambda: _set_task(task)
+
+        def _make_task_check(task):
+            return lambda item: _settings.get("task", "transcribe") == task
+
+        def _task_items():
+            return [
+                pystray.MenuItem(
+                    label,
+                    _make_task_action(task),
+                    checked=_make_task_check(task),
+                    radio=True,
+                )
+                for task, label in _TASK_OPTIONS.items()
+            ]
+
+        def _make_language_action(code):
+            return lambda: _set_language(code)
+
+        def _make_language_check(code):
+            return lambda item: _settings.get("language") == code
+
+        def _language_items():
+            return [
+                pystray.MenuItem(
+                    label,
+                    _make_language_action(code),
+                    checked=_make_language_check(code),
+                    radio=True,
+                )
+                for code, label in LANGUAGE_OPTIONS.items()
+            ]
+
+        def _meeting_label():
+            if _meeting_recorder is not None and _meeting_recorder.active:
+                return "Stop Meeting Mode"
+            return "Start Meeting Mode"
+
+        def _menu_items():
+            items = [
+                pystray.MenuItem("Voice Type", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(
+                    "Enabled",
+                    self._toggle_enabled,
+                    checked=lambda item: self.enabled,
+                ),
+                pystray.MenuItem(
+                    lambda item: _meeting_label(),
+                    self._toggle_meeting_mode,
+                ),
+                pystray.MenuItem(
+                    "Formatter Enabled",
+                    lambda: _set_formatter_enabled(not _settings.get("formatter_enabled", False)),
+                    checked=lambda item: bool(_settings.get("formatter_enabled", False)),
+                ),
+                pystray.MenuItem("Open Log", self._open_log),
+                pystray.MenuItem(
+                    "Run on Startup",
+                    self._toggle_startup,
+                    checked=lambda item: platform.startup_enabled(_VBS_PATH),
+                ),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Final Model", pystray.Menu(lambda: _final_model_items())),
+                pystray.MenuItem("Preview Model", pystray.Menu(lambda: _stream_model_items())),
+                pystray.MenuItem("Output Mode", pystray.Menu(lambda: _output_mode_items())),
+                pystray.MenuItem("Language", pystray.Menu(lambda: _language_items())),
+                pystray.MenuItem("Task", pystray.Menu(lambda: _task_items())),
+                pystray.MenuItem("Audio Source", pystray.Menu(lambda: _audio_source_items())),
+            ]
+            if _settings.get("formatter_enabled", False):
+                items.append(pystray.MenuItem("Formatter", pystray.Menu(lambda: _formatter_section_items())))
+            items.extend([
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Exit", self._on_exit),
+            ])
+            return items
+
+        menu = pystray.Menu(lambda: _menu_items())
+
+        self._icon = pystray.Icon(
+            "voice-type",
+            _make_tray_icon("idle"),
+            _TRAY_LABELS["idle"],
+        )
+
+        def _icon_setup(icon):
+            icon.visible = True
+            icon.menu = menu
+            icon.update_menu()
+            log("Tray menu attached.")
+
+        self._icon.run_detached(setup=_icon_setup)
+        log("Tray icon started.")
+
+    def set_state(self, state: str):
+        """Thread-safe: update icon colour and tooltip to reflect current state."""
+        if self._icon is None:
+            return
+        effective = "disabled" if not self.enabled else state
+        self._icon.icon  = _make_tray_icon(effective)
+        self._icon.title = _TRAY_LABELS.get(effective, "Voice Type")
+
+    # ---- Menu callbacks (called on pystray's thread) ----
+
+    def _toggle_enabled(self, icon, item):
+        self.enabled = not self.enabled
+        log(f"Voice Type {'enabled' if self.enabled else 'disabled'} via tray.")
+        self.set_state("idle")
+
+    def _open_log(self, icon, item):
+        platform.open_log(_LOG_PATH)
+
+    def _toggle_startup(self, icon, item):
+        platform.set_startup(not platform.startup_enabled(_VBS_PATH), _VBS_PATH, log)
+
+    def _toggle_meeting_mode(self, icon=None, item=None):
+        if _meeting_recorder is None:
+            return
+        if _meeting_recorder.active:
+            _meeting_recorder.stop()
+            self.enabled = True  # re-enable push-to-talk
+            log("Meeting mode stopped. Push-to-talk re-enabled.")
+            self.set_state("idle")
+        else:
+            # Disable push-to-talk while meeting mode is active
+            self.enabled = False
+            path = _meeting_recorder.start()
+            if path is None:
+                self.enabled = True  # re-enable on failure
+                log("Meeting mode failed to start.")
+            else:
+                log(f"Meeting mode active. Push-to-talk disabled. Transcript: {path}")
+            self.set_state("idle")
+
+    def _edit_formatter_prompt(self, icon=None, item=None):
+        self._overlay.edit_text(
+            title="Edit Formatter System Prompt",
+            initial_text=resolve_system_prompt(_settings.get("formatter_system_prompt")),
+            on_save=_set_formatter_system_prompt,
+            reset_text=DEFAULT_FORMATTER_SYSTEM_PROMPT,
+        )
+
+    def _reset_formatter_prompt(self, icon=None, item=None):
+        _set_formatter_system_prompt(DEFAULT_FORMATTER_SYSTEM_PROMPT)
+
+    def _on_exit(self, icon, item):
+        log("Exit requested via tray.")
+        if _meeting_recorder is not None and _meeting_recorder.active:
+            _meeting_recorder.stop()
+        icon.stop()
+        self._overlay.quit()   # ask tkinter main loop to exit cleanly
+
+
+def _build_control_state(tray) -> dict:
+    return {
+        "enabled": tray.enabled,
+        "ui_state": getattr(tray, "_state", "idle"),
+        "final_model": _settings.get("final_model"),
+        "stream_model": _settings.get("stream_model"),
+        "output_mode": _settings.get("output_mode"),
+        "formatter_enabled": bool(_settings.get("formatter_enabled", False)),
+        "formatter_model": _settings.get("formatter_model"),
+        "language": _settings.get("language"),
+        "startup_enabled": platform.startup_enabled(_VBS_PATH),
+        "log_path": _LOG_PATH,
+        "final_model_options": FINAL_MODEL_OPTIONS,
+        "stream_model_options": STREAM_MODEL_OPTIONS,
+        "output_mode_options": OUTPUT_MODE_OPTIONS,
+        "formatter_model_options": FORMATTER_MODEL_OPTIONS,
+        "model_labels": MODEL_LABELS,
+        "output_mode_labels": _OUTPUT_MODE_LABELS,
+        "formatter_model_labels": {
+            name: FORMATTER_MODEL_PRESETS[name].label
+            for name in FORMATTER_MODEL_OPTIONS
+        },
+    }
+
+
+def _apply_settings_changes(*, tray, updates: dict) -> None:
+    enabled = bool(updates.get("enabled", True))
+    if tray.enabled != enabled:
+        tray.enabled = enabled
+        log(f"Voice Type {'enabled' if enabled else 'disabled'} via settings.")
+        tray.set_state("idle")
+
+    startup_enabled = bool(updates.get("startup_enabled", False))
+    if platform.startup_enabled(_VBS_PATH) != startup_enabled:
+        platform.set_startup(startup_enabled, _VBS_PATH, log)
+
+    _set_final_model(str(updates.get("final_model", _settings.get("final_model"))))
+    _set_stream_model(str(updates.get("stream_model", _settings.get("stream_model"))))
+    _set_output_mode(str(updates.get("output_mode", _settings.get("output_mode"))))
+    _set_formatter_enabled(bool(updates.get("formatter_enabled", _settings.get("formatter_enabled", False))))
+    _set_formatter_model(str(updates.get("formatter_model", _settings.get("formatter_model"))))
+
+    if "language" in updates:
+        _set_language(updates["language"])
+
+
+def _restart_app() -> None:
+    log("Restart requested from settings window.")
+    script = os.path.join(_SCRIPT_DIR, "restart.bat")
+    if os.path.exists(script):
+        subprocess.Popen(
+            ["cmd", "/c", script], cwd=_SCRIPT_DIR,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0),
+        )
+
+
+def _show_settings_dialog(overlay: "Overlay", tray) -> None:
+    overlay.edit_settings(
+        state=_build_control_state(tray),
+        on_save=lambda updates: _apply_settings_changes(tray=tray, updates=updates),
+        on_open_log=lambda: platform.open_log(_LOG_PATH),
+        on_restart=_restart_app,
+        defer_until_hidden=False,
+    )
+
+
+def _queue_settings_dialog_after_hide(overlay: "Overlay", tray) -> None:
+    overlay.edit_settings(
+        state=_build_control_state(tray),
+        on_save=lambda updates: _apply_settings_changes(tray=tray, updates=updates),
+        on_open_log=lambda: platform.open_log(_LOG_PATH),
+        on_restart=_restart_app,
+        defer_until_hidden=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Overlay window — must be created and run on the MAIN thread (Windows/Tk rule)
+# ---------------------------------------------------------------------------
+
+# Colours
+_OVL_BG      = "#1C1C1E"   # dark charcoal background
+_COL_REC     = "#FF453A"   # iOS-style red
+_COL_PROC    = "#FF9F0A"   # iOS-style amber
+_COL_TEXT    = "#EBEBF5"   # near-white
+_COL_PREVIEW = "#8E8E93"   # grey for partial text
+
+# Waveform bar geometry
+_N_BARS    = 7
+_BAR_W     = 4
+_BAR_GAP   = 3
+_CANVAS_W  = _N_BARS * _BAR_W + (_N_BARS - 1) * _BAR_GAP  # 46 px
+_CANVAS_H  = 28
+_BAR_MAX_H = 20
+_BAR_MIN_H = 3
+
+def _wrap_preview(text: str) -> str:
+    return wrap_preview(text)
+
+
+class Overlay:
+    def __init__(self, get_level):
+        """
+        get_level: callable() -> float  — returns current mic RMS (0.0–1.0).
+        Used to drive the waveform animation while recording.
+        """
+        self._get_level = get_level
+        self._state     = "hidden"   # "hidden" | "rec" | "processing"
+        self._bar_h     = [float(_BAR_MIN_H)] * _N_BARS
+        self._monitor   = None       # cached work-area tuple for reposition
+        self._on_click  = None
+
+        self._root = tk.Tk()
+        self._root.withdraw()
+        self._bar_ids = []
+
+        self._root.overrideredirect(True)
+        self._root.attributes("-topmost", True)
+        self._root.configure(bg=_OVL_BG)
+        self._root.resizable(False, False)
+
+        self._accent = tk.Frame(self._root, width=4, bg=_COL_REC)
+        self._accent.pack(side="left", fill="y")
+
+        body = tk.Frame(self._root, bg=_OVL_BG, padx=10, pady=8)
+        body.pack(side="left", fill="both", expand=True)
+
+        top = tk.Frame(body, bg=_OVL_BG)
+        top.pack(fill="x")
+
+        self._dot = tk.Label(top, text="\u25cf", fg=_COL_REC, bg=_OVL_BG,
+                             font=("Segoe UI", 8))
+        self._dot.pack(side="left")
+
+        self._label = tk.Label(top, text=" REC", fg=_COL_TEXT, bg=_OVL_BG,
+                               font=("Segoe UI", 10, "bold"))
+        self._label.pack(side="left")
+
+        self._canvas = tk.Canvas(top, width=_CANVAS_W + 4, height=_CANVAS_H,
+                                 bg=_OVL_BG, highlightthickness=0)
+        self._canvas.pack(side="left", padx=(12, 0))
+
+        for i in range(_N_BARS):
+            x0 = 2 + i * (_BAR_W + _BAR_GAP)
+            x1 = x0 + _BAR_W
+            y1 = _CANVAS_H - 2
+            y0 = y1 - _BAR_MIN_H
+            rid = self._canvas.create_rectangle(x0, y0, x1, y1,
+                                                fill=_COL_REC, outline="")
+            self._bar_ids.append(rid)
+
+        self._preview = tk.Label(body, text="", fg=_COL_PREVIEW, bg=_OVL_BG,
+                                 font=("Segoe UI", 12), anchor="w",
+                                 justify="left", wraplength=360,
+                                 pady=2)
+
+        platform.apply_overlay_no_activate(self._root)
+        for widget in (
+            self._root, self._accent, body, top, self._dot, self._label,
+            self._canvas, self._preview,
+        ):
+            widget.bind("<Button-1>", self._handle_click, add="+")
+
+        self._visible   = False
+        self._editor_win = None
+        self._settings_win = None
+        self._dialog_requested = False
+        self._pending_settings_payload = None
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._root.after(50,  self._poll)
+        self._root.after(33,  self._animate)   # 30 fps animation loop
+
+    # -- Thread-safe public commands --
+
+    def show_rec(self, preview: str = ""):
+        self._cmd_queue.put(("rec", preview))
+
+    def show_processing(self, preview: str = ""):
+        self._cmd_queue.put(("processing", preview))
+
+    def hide(self):
+        self._cmd_queue.put(("hide", ""))
+
+    def edit_text(self, title: str, initial_text: str, on_save, reset_text: str | None = None):
+        self._dialog_requested = True
+        self._cmd_queue.put((
+            "edit_text",
+            {
+                "title": title,
+                "initial_text": initial_text,
+                "on_save": on_save,
+                "reset_text": reset_text,
+            },
+        ))
+
+    def edit_settings(self, state: dict, on_save, on_open_log, on_restart=None,
+                      defer_until_hidden: bool = False):
+        self._dialog_requested = True
+        self._cmd_queue.put((
+            "edit_settings",
+            {
+                "state": state,
+                "on_save": on_save,
+                "on_open_log": on_open_log,
+                "on_restart": on_restart,
+                "defer_until_hidden": defer_until_hidden,
+            },
+        ))
+
+    def set_click_action(self, on_click) -> None:
+        self._on_click = on_click
+
+    def quit(self):
+        self._cmd_queue.put(("quit", ""))
+
+    def mainloop(self):
+        self._root.mainloop()
+
+    # -- Internal (main thread only) --
+
+    def _poll(self):
+        try:
+            while True:
+                cmd, preview = self._cmd_queue.get_nowait()
+                if cmd == "quit":
+                    self._root.destroy()
+                    sys.exit(0)
+                elif cmd == "hide":
+                    if self._has_open_or_pending_dialogs():
+                        self._move_overlay_offscreen()
+                    else:
+                        self._root.withdraw()
+                    self._visible = False
+                    self._state   = "hidden"
+                    if self._pending_settings_payload is not None:
+                        payload = self._pending_settings_payload
+                        self._pending_settings_payload = None
+                        self._root.after(10, lambda payload=payload: self._open_settings_editor(payload))
+                elif cmd == "edit_text":
+                    self._open_text_editor(preview)
+                elif cmd == "edit_settings":
+                    if preview.get("defer_until_hidden") and self._visible:
+                        self._pending_settings_payload = preview
+                    else:
+                        self._open_settings_editor(preview)
+                else:
+                    self._state = cmd
+                    col   = _COL_REC  if cmd == "rec" else _COL_PROC
+                    label = " REC"    if cmd == "rec" else " ..."
+                    self._accent.configure(bg=col)
+                    self._dot.configure(fg=col)
+                    self._label.configure(text=label)
+                    for rid in self._bar_ids:
+                        self._canvas.itemconfigure(rid, fill=col)
+                    if preview:
+                        self._preview.configure(text=preview)
+                        self._preview.pack(fill="x")
+                    else:
+                        self._preview.pack_forget()
+                    if not self._visible:
+                        self._position()
+                        self._root.attributes("-alpha", 1.0)
+                        self._root.deiconify()
+                        self._visible = True
+                    else:
+                        self._reposition()
+        except queue.Empty:
+            pass
+        self._root.after(50, self._poll)
+
+    def _handle_click(self, _event):
+        if not self._visible or self._on_click is None:
+            return None
+        self._on_click()
+        return "break"
+
+    def _has_open_dialogs(self) -> bool:
+        return any(
+            win is not None and win.winfo_exists()
+            for win in (self._editor_win, self._settings_win)
+        )
+
+    def _has_open_or_pending_dialogs(self) -> bool:
+        return (
+            self._dialog_requested
+            or self._pending_settings_payload is not None
+            or self._has_open_dialogs()
+        )
+
+    def _move_overlay_offscreen(self) -> None:
+        self._root.attributes("-alpha", 0.0)
+        self._root.geometry("1x1+-2000+-2000")
+
+    def _animate(self):
+        if self._visible and self._state != "hidden":
+            t = time.perf_counter()
+            if self._state == "rec":
+                raw   = self._get_level()
+                level = min(raw * 14.0, 1.0)   # typical mic RMS is 0.01–0.07
+                for i in range(_N_BARS):
+                    phase = i * 0.75
+                    freq  = 4.5 + i * 0.4
+                    wave  = (math.sin(t * freq + phase) + 1) / 2
+                    target = _BAR_MIN_H + (_BAR_MAX_H - _BAR_MIN_H) * (
+                        level * 0.75 + wave * (0.25 + level * 0.15)
+                    )
+                    self._bar_h[i] = self._bar_h[i] * 0.5 + target * 0.5
+            else:
+                # Processing: smooth travelling sine sweep
+                for i in range(_N_BARS):
+                    wave   = (math.sin(t * 3.5 + i * 0.75) + 1) / 2
+                    target = _BAR_MIN_H + (_BAR_MAX_H - _BAR_MIN_H) * wave * 0.55
+                    self._bar_h[i] = self._bar_h[i] * 0.6 + target * 0.4
+
+            y_base = _CANVAS_H - 2
+            for i, (rid, h) in enumerate(zip(self._bar_ids, self._bar_h)):
+                x0 = 2 + i * (_BAR_W + _BAR_GAP)
+                x1 = x0 + _BAR_W
+                self._canvas.coords(rid, x0, y_base - int(h), x1, y_base)
+
+        self._root.after(33, self._animate)
+
+    def _open_text_editor(self, payload):
+        self._dialog_requested = False
+        if self._editor_win is not None and self._editor_win.winfo_exists():
+            self._editor_win.deiconify()
+            self._editor_win.lift()
+            self._editor_win.focus_force()
+            return
+
+        title = payload["title"]
+        initial_text = payload["initial_text"]
+        on_save = payload["on_save"]
+        reset_text = payload.get("reset_text")
+
+        win = tk.Toplevel(self._root)
+        self._editor_win = win
+        win.title(title)
+        win.geometry("760x520")
+        win.minsize(520, 360)
+        win.configure(bg=_OVL_BG)
+
+        body = tk.Frame(win, bg=_OVL_BG, padx=12, pady=12)
+        body.pack(fill="both", expand=True)
+
+        label = tk.Label(
+            body,
+            text="Changes are saved to settings.json and used for future formatter runs.",
+            fg=_COL_TEXT,
+            bg=_OVL_BG,
+            anchor="w",
+            justify="left",
+        )
+        label.pack(fill="x", pady=(0, 8))
+
+        editor = scrolledtext.ScrolledText(
+            body,
+            wrap="word",
+            font=("Consolas", 10),
+            undo=True,
+            padx=8,
+            pady=8,
+        )
+        editor.pack(fill="both", expand=True)
+        editor.insert("1.0", initial_text)
+        editor.focus_set()
+
+        buttons = tk.Frame(body, bg=_OVL_BG)
+        buttons.pack(fill="x", pady=(10, 0))
+
+        def _close():
+            if win.winfo_exists():
+                win.destroy()
+            self._editor_win = None
+            if not self._visible and not self._has_open_or_pending_dialogs():
+                self._root.withdraw()
+
+        def _save():
+            text = editor.get("1.0", "end-1c")
+            try:
+                on_save(text)
+            except Exception as e:
+                messagebox.showerror("voice-type", str(e), parent=win)
+                return
+            _close()
+
+        def _reset():
+            if reset_text is None:
+                return
+            editor.delete("1.0", "end")
+            editor.insert("1.0", reset_text)
+
+        tk.Button(buttons, text="Save", command=_save, width=10).pack(side="right")
+        tk.Button(buttons, text="Cancel", command=_close, width=10).pack(side="right", padx=(0, 8))
+        if reset_text is not None:
+            tk.Button(buttons, text="Reset Default", command=_reset, width=14).pack(side="left")
+
+        win.protocol("WM_DELETE_WINDOW", _close)
+
+    def _open_settings_editor(self, payload):
+        self._dialog_requested = False
+        if self._settings_win is not None and self._settings_win.winfo_exists():
+            self._settings_win.deiconify()
+            self._settings_win.lift()
+            self._settings_win.focus_force()
+            return
+
+        state = payload["state"]
+        on_save = payload["on_save"]
+        on_open_log = payload["on_open_log"]
+        on_restart = payload.get("on_restart")
+
+        def _choice_maps(options: list[str], labels: dict[str, str]):
+            value_to_label = {value: labels.get(value, value) for value in options}
+            label_to_value = {label: value for value, label in value_to_label.items()}
+            return value_to_label, label_to_value
+
+        final_v2l, final_l2v = _choice_maps(state["final_model_options"], state["model_labels"])
+        stream_v2l, stream_l2v = _choice_maps(state["stream_model_options"], state["model_labels"])
+        output_v2l, output_l2v = _choice_maps(state["output_mode_options"], state["output_mode_labels"])
+        formatter_v2l, formatter_l2v = _choice_maps(
+            state["formatter_model_options"], state["formatter_model_labels"]
+        )
+
+        win = tk.Toplevel(self._root)
+        self._settings_win = win
+        win.title("Voice Type Settings")
+        win.geometry("560x420")
+        win.minsize(520, 380)
+
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            body,
+            text="Save changes to update the running app and persist them to settings.json.",
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        enabled_var = tk.BooleanVar(value=bool(state["enabled"]))
+        startup_var = tk.BooleanVar(value=bool(state["startup_enabled"]))
+        formatter_enabled_var = tk.BooleanVar(value=bool(state["formatter_enabled"]))
+
+        final_var = tk.StringVar(value=final_v2l[state["final_model"]])
+        stream_var = tk.StringVar(value=stream_v2l[state["stream_model"]])
+        output_var = tk.StringVar(value=output_v2l[state["output_mode"]])
+        formatter_var = tk.StringVar(value=formatter_v2l[state["formatter_model"]])
+
+        row = 1
+
+        ttk.Checkbutton(body, text="Voice Type Enabled", variable=enabled_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
+        row += 1
+
+        ttk.Checkbutton(body, text="Run on Startup", variable=startup_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 14)
+        )
+        row += 1
+
+        ttk.Label(body, text="Final Model").grid(row=row, column=0, sticky="w", pady=4)
+        final_combo = ttk.Combobox(
+            body,
+            textvariable=final_var,
+            values=[final_v2l[value] for value in state["final_model_options"]],
+            state="readonly",
+        )
+        final_combo.grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(body, text="Preview Model").grid(row=row, column=0, sticky="w", pady=4)
+        stream_combo = ttk.Combobox(
+            body,
+            textvariable=stream_var,
+            values=[stream_v2l[value] for value in state["stream_model_options"]],
+            state="readonly",
+        )
+        stream_combo.grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Label(body, text="Output Mode").grid(row=row, column=0, sticky="w", pady=4)
+        output_combo = ttk.Combobox(
+            body,
+            textvariable=output_var,
+            values=[output_v2l[value] for value in state["output_mode_options"]],
+            state="readonly",
+        )
+        output_combo.grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Checkbutton(body, text="Formatter Enabled", variable=formatter_enabled_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(10, 4)
+        )
+        row += 1
+
+        ttk.Label(body, text="Formatter Model").grid(row=row, column=0, sticky="w", pady=4)
+        formatter_combo = ttk.Combobox(
+            body,
+            textvariable=formatter_var,
+            values=[formatter_v2l[value] for value in state["formatter_model_options"]],
+            state="readonly",
+        )
+        formatter_combo.grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        buttons.columnconfigure(0, weight=1)
+
+        def _sync_formatter_state():
+            formatter_combo.configure(
+                state="readonly" if formatter_enabled_var.get() else "disabled"
+            )
+
+        def _close():
+            if win.winfo_exists():
+                win.destroy()
+            self._settings_win = None
+            if not self._visible and not self._has_open_or_pending_dialogs():
+                self._root.withdraw()
+
+        def _save():
+            updates = {
+                "enabled": enabled_var.get(),
+                "startup_enabled": startup_var.get(),
+                "final_model": final_l2v[final_var.get()],
+                "stream_model": stream_l2v[stream_var.get()],
+                "output_mode": output_l2v[output_var.get()],
+                "formatter_enabled": formatter_enabled_var.get(),
+                "formatter_model": formatter_l2v[formatter_var.get()],
+            }
+            try:
+                on_save(updates)
+            except Exception as e:
+                messagebox.showerror("voice-type", str(e), parent=win)
+                return
+            _close()
+
+        formatter_enabled_var.trace_add("write", lambda *_args: _sync_formatter_state())
+        _sync_formatter_state()
+
+        left_buttons = ttk.Frame(buttons)
+        left_buttons.grid(row=0, column=0, sticky="w")
+        ttk.Button(left_buttons, text="Open Log", command=on_open_log).pack(side="left")
+
+        if on_restart is not None:
+            def _restart():
+                if not messagebox.askyesno(
+                    "voice-type",
+                    "Restart Voice Type now?\n\n"
+                    "This kills the current process and relaunches it.",
+                    parent=win,
+                ):
+                    return
+                try:
+                    on_restart()
+                except Exception as e:
+                    messagebox.showerror(
+                        "voice-type", f"Restart failed: {e}", parent=win
+                    )
+
+            ttk.Button(left_buttons, text="Restart", command=_restart).pack(
+                side="left", padx=(8, 0)
+            )
+
+        ttk.Button(buttons, text="Cancel", command=_close).grid(row=0, column=1, sticky="e", padx=(0, 8))
+        ttk.Button(buttons, text="Save", command=_save).grid(row=0, column=2, sticky="e")
+
+        win.protocol("WM_DELETE_WINDOW", _close)
+        win.focus_force()
+
+    def _position(self):
+        """Position at bottom-centre of the monitor holding the focused window."""
+        try:
+            self._monitor = platform.get_foreground_monitor_work_area()
+        except Exception:
+            self._monitor = (0, 0,
+                             self._root.winfo_screenwidth(),
+                             self._root.winfo_screenheight())
+        self._do_geometry()
+
+    def _reposition(self):
+        """Re-centre after size changes (preview text appearing/disappearing)."""
+        if self._monitor is None:
+            self._position()
+            return
+        self._do_geometry()
+
+    def _do_geometry(self):
+        left, _, right, bottom = self._monitor
+        self._root.update_idletasks()
+        w = self._root.winfo_reqwidth()
+        h = self._root.winfo_reqheight()
+        x = left + (right - left) // 2 - w // 2
+        y = bottom - h - 20
+        self._root.geometry(f"+{x}+{y}")
+
+
+# ---------------------------------------------------------------------------
+# Audio recorder
+# ---------------------------------------------------------------------------
+
+class Recorder:
+    """Owns the microphone/loopback stream and captures audio while recording."""
+
+    def __init__(self):
+        self._frames: list[np.ndarray] = []
+        self._lock = threading.Lock()
+        self._recording = False
+        self._stream_error = False
+        self._keep_stream_open = should_keep_mic_stream_open_local()
+        self._stream: sd.InputStream | None = None
+        # pyaudiowpatch state (used for loopback when sounddevice has no loopback devices)
+        self._pa_instance = None   # pyaudio.PyAudio()
+        self._pa_stream = None     # pyaudio stream
+        # Loopback device state (native sample rate / channels differ from 16kHz mono)
+        self._dev_sr: int = SAMPLE_RATE
+        self._dev_channels: int = CHANNELS
+        self._using_loopback: bool = False
+        self._opened_source: str | None = None  # tracks which source the stream was opened for
+        if self._keep_stream_open:
+            self._open_stream()
+
+    def _open_stream(self):
+        source = _settings.get("audio_source", "mic")
+        self._opened_source = source
+        if source == "loopback":
+            # Try sounddevice loopback devices first, then pyaudiowpatch
+            dev_idx = find_loopback_device()
+            if dev_idx is not None:
+                self._open_sd_loopback_stream(dev_idx)
+                return
+            if self._try_open_pyaudio_loopback():
+                return
+            log("Loopback not available. Install pyaudiowpatch: pip install pyaudiowpatch")
+            self._open_mic_stream()
+        else:
+            self._open_mic_stream()
+
+    def _open_sd_loopback_stream(self, dev_idx: int):
+        """Open a sounddevice loopback stream (for systems that enumerate loopback devices)."""
+        dev_info = sd.query_devices(dev_idx)
+        dev_name = dev_info.get("name", f"device {dev_idx}")
+        dev_sr = int(dev_info.get("default_samplerate", SAMPLE_RATE))
+        channels = min(dev_info.get("max_input_channels", 2), 2)
+        log(f"Loopback (sd): {dev_name!r}  sr={dev_sr}  ch={channels}")
+        self._dev_sr = dev_sr
+        self._dev_channels = channels
+        self._using_loopback = True
+        self._stream = sd.InputStream(
+            samplerate=dev_sr, channels=channels, dtype=DTYPE,
+            device=dev_idx, callback=self._callback, blocksize=1024,
+        )
+        self._stream.start()
+
+    def _try_open_pyaudio_loopback(self) -> bool:
+        """Try WASAPI loopback via pyaudiowpatch. Returns True on success."""
+        try:
+            import pyaudiowpatch as pyaudio
+        except ImportError:
+            log("pyaudiowpatch not installed — cannot open WASAPI loopback.")
+            return False
+
+        try:
+            p = pyaudio.PyAudio()
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_idx = wasapi_info["defaultOutputDevice"]
+            speakers = p.get_device_info_by_index(default_idx)
+
+            if not speakers.get("isLoopbackDevice", False):
+                # Find the loopback counterpart for the default output device
+                for loopback in p.get_loopback_device_info_generator():
+                    if loopback["name"].startswith(speakers["name"]):
+                        speakers = loopback
+                        break
+
+            dev_name = speakers["name"]
+            dev_sr = int(speakers["defaultSampleRate"])
+            channels = speakers["maxInputChannels"]
+
+            log(f"Loopback (pyaudio): {dev_name!r}  sr={dev_sr}  ch={channels}")
+
+            self._dev_sr = dev_sr
+            self._dev_channels = channels
+            self._using_loopback = True
+
+            self._pa_stream = p.open(
+                format=pyaudio.paFloat32,
+                channels=channels,
+                rate=dev_sr,
+                frames_per_buffer=512,
+                input=True,
+                input_device_index=speakers["index"],
+                stream_callback=self._pa_callback,
+            )
+            self._pa_instance = p
+            return True
+        except Exception as e:
+            log(f"pyaudiowpatch loopback failed: {e}")
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            return False
+
+    def _pa_callback(self, in_data, frame_count, time_info, status_flags):
+        """pyaudiowpatch stream callback — converts bytes to numpy frames."""
+        import pyaudiowpatch as pyaudio
+        audio = np.frombuffer(in_data, dtype=np.float32)
+        audio = audio.reshape(-1, self._dev_channels)
+        if self._recording:
+            with self._lock:
+                self._frames.append(audio.copy())
+        return (None, pyaudio.paContinue)
+
+    def _open_mic_stream(self):
+        info = sd.query_devices(DEVICE, "input")
+        log(f"Mic: {info['name']!r}")
+        self._dev_sr = SAMPLE_RATE
+        self._dev_channels = CHANNELS
+        self._using_loopback = False
+        self._stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+            device=DEVICE, callback=self._callback, blocksize=256,
+        )
+        self._stream.start()
+
+    def _close_stream(self):
+        # Close pyaudiowpatch stream if active
+        if self._pa_stream is not None:
+            pa_stream = self._pa_stream
+            pa_instance = self._pa_instance
+            self._pa_stream = None
+            self._pa_instance = None
+            try:
+                pa_stream.stop_stream()
+                pa_stream.close()
+            except Exception as e:
+                log(f"PyAudio stream close error (ignored): {e}")
+            try:
+                pa_instance.terminate()
+            except Exception:
+                pass
+            return
+
+        # Close sounddevice stream
+        if self._stream is None:
+            return
+        stream = self._stream
+        self._stream = None
+
+        def _do_close():
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as e:
+                log(f"Stream close error (ignored): {e}")
+
+        t = threading.Thread(target=_do_close, daemon=True,
+                             name="voice-type-stream-close")
+        t.start()
+        t.join(timeout=STREAM_CLOSE_TIMEOUT)
+        if t.is_alive():
+            log(f"Stream close timed out after {STREAM_CLOSE_TIMEOUT}s; "
+                "abandoning stream, will reopen on next use.")
+
+    def _has_active_stream(self) -> bool:
+        """Check if any stream (sounddevice or pyaudio) is open and active."""
+        if self._pa_stream is not None:
+            return self._pa_stream.is_active()
+        if self._stream is not None:
+            return self._stream.active
+        return False
+
+    def _ensure_stream(self):
+        if self._stream is None and self._pa_stream is None:
+            self._open_stream()
+            self._stream_error = False
+            return
+
+        # Reopen if the audio source setting changed since the stream was opened
+        current_source = _settings.get("audio_source", "mic")
+        source_changed = self._opened_source != current_source
+
+        needs_restart = self._stream_error or not self._has_active_stream() or source_changed
+        if not needs_restart:
+            return
+        reason = ("audio source changed" if source_changed
+                  else "error flag set" if self._stream_error
+                  else "stream inactive")
+        log(f"Audio stream needs restart ({reason}), reconnecting...")
+        self._close_stream()
+        try:
+            self._open_stream()
+            self._stream_error = False
+            log("Audio stream restarted successfully.")
+        except Exception as e:
+            log(f"Audio stream restart failed: {e}")
+
+    def start(self):
+        self._ensure_stream()
+        with self._lock:
+            self._frames    = []
+            self._recording = True
+
+    def _convert_audio(self, audio: np.ndarray) -> np.ndarray:
+        """Convert raw audio to 16kHz mono float32.
+
+        For mic: just flatten (N,1) -> (N,).
+        For loopback: stereo->mono, resample native SR to 16kHz.
+        """
+        # Stereo to mono
+        if audio.ndim > 1 and audio.shape[1] > 1:
+            audio = np.mean(audio, axis=1)
+        audio = audio.flatten().astype(np.float32)
+        # Resample to 16kHz if needed (loopback devices use native SR)
+        if self._dev_sr != SAMPLE_RATE and len(audio) > 0:
+            from math import gcd
+            g = gcd(SAMPLE_RATE, self._dev_sr)
+            up, down = SAMPLE_RATE // g, self._dev_sr // g
+            from scipy.signal import resample_poly
+            audio = resample_poly(audio, up, down).astype(np.float32)
+        return audio
+
+    def peek(self) -> np.ndarray:
+        """Non-destructive snapshot of all audio recorded so far (16kHz mono)."""
+        with self._lock:
+            if not self._frames:
+                return np.array([], dtype=np.float32)
+            raw = np.concatenate(self._frames, axis=0)
+        return self._convert_audio(raw)
+
+    def get_rms(self) -> float:
+        """RMS of the last ~100 ms of audio — drives the waveform animation."""
+        with self._lock:
+            if not self._frames:
+                return 0.0
+            recent = np.concatenate(self._frames[-2:], axis=0).flatten()
+            if len(recent) == 0:
+                return 0.0
+            return float(np.sqrt(np.mean(recent ** 2)))
+
+    def stop(self) -> np.ndarray:
+        with self._lock:
+            self._recording = False
+            if not self._frames:
+                raw = np.array([], dtype=np.float32)
+            else:
+                raw = np.concatenate(self._frames, axis=0)
+
+        if not self._keep_stream_open:
+            self._close_stream()
+
+        if len(raw) == 0:
+            return np.array([], dtype=np.float32)
+
+        audio = self._convert_audio(raw)
+
+        dur = len(audio) / SAMPLE_RATE
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        peak = float(np.max(np.abs(audio)))
+        log(f"Stopped: {dur:.2f}s  rms={rms:.4f}  peak={peak:.4f}")
+        return audio
+
+    def _callback(self, indata, frames, time_info, status):
+        if status:
+            log(f"Audio status: {status}")
+            self._stream_error = True
+        if self._recording:
+            self._frames.append(indata.copy())
+
+
+# ---------------------------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------------------------
+
+def transcribe(audio: np.ndarray, verbose: bool = True, on_segment=None) -> str:
+    """Transcribe audio using the final model."""
+    duration = len(audio) / SAMPLE_RATE
+    if duration < 0.3:
+        return ""
+    model    = get_model()
+    lang = _settings.get("language", "en")
+    task = _settings.get("task", "transcribe")
+    if verbose:
+        log(f"Transcribing {duration:.1f}s  language={lang!r}  task={task!r}")
+    segments, info = model.transcribe(
+        audio,
+        language=lang,
+        task=task,
+        vad_filter=False,
+        beam_size=1,
+        condition_on_previous_text=False,
+    )
+    parts = []
+    for seg in segments:
+        text = seg.text.strip()
+        if text:
+            parts.append(text)
+            if on_segment:
+                on_segment(text)
+    result = _apply_corrections(" ".join(parts).strip())
+    if verbose:
+        log(f"Transcribed {duration:.1f}s -> {result!r}  "
+            f"(lang={info.language} p={info.language_probability:.2f})")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Streaming transcriber — runs while key is held
+# ---------------------------------------------------------------------------
+
+class StreamingTranscriber:
+    def __init__(self, recorder: Recorder, overlay: Overlay):
+        self._recorder = recorder
+        self._overlay  = overlay
+        self._active   = False
+        self._last_text = ""
+
+    def start(self):
+        if self._active:
+            return
+        self._active    = True
+        self._last_text = ""
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._active = False
+
+    @property
+    def last_preview(self) -> str:
+        return _wrap_preview(self._last_text)
+
+    def _loop(self):
+        time.sleep(STREAM_INTERVAL)
+        while self._active:
+            model = get_stream_model()
+            if model is None:
+                time.sleep(STREAM_INTERVAL)
+                continue
+
+            audio = self._recorder.peek()
+            if len(audio) >= SAMPLE_RATE * STREAM_MIN_AUDIO:
+                if not self._active:
+                    break
+                t0 = time.perf_counter()
+                lang = _settings.get("language", "en")
+                task = _settings.get("task", "transcribe")
+                segs, _ = model.transcribe(
+                    audio, language=lang, task=task, vad_filter=False,
+                    beam_size=1, condition_on_previous_text=False,
+                )
+                text = " ".join(s.text.strip() for s in segs).strip()
+                if not self._active:
+                    break
+                elapsed = time.perf_counter() - t0
+                log(f"Stream pass: {len(audio)/SAMPLE_RATE:.1f}s -> {elapsed:.2f}s -> {text[:60]!r}")
+                self._last_text = text
+                self._overlay.show_rec(_wrap_preview(text))
+            time.sleep(STREAM_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Final-model precompute worker — runs while key is held (precompute mode)
+# ---------------------------------------------------------------------------
+
+class FinalPrecomputer:
+    def __init__(self, recorder: Recorder):
+        self._recorder = recorder
+        self._active = False
+        self._lock = threading.Lock()
+        self._best_text = ""
+        self._best_samples = 0
+        self._last_requested_samples = 0
+        self._run_id = 0
+        self._thread: threading.Thread | None = None
+        self._inflight = False
+
+    def start(self):
+        with self._lock:
+            self._best_text = ""
+            self._best_samples = 0
+            self._last_requested_samples = 0
+            self._run_id += 1
+            run_id = self._run_id
+            self._inflight = False
+        self._active = True
+        self._thread = threading.Thread(target=self._loop, args=(run_id,), daemon=True)
+        self._thread.start()
+
+    def stop(self, wait: float = 0.0):
+        self._active = False
+        if wait > 0 and self._thread is not None:
+            self._thread.join(timeout=wait)
+
+    def snapshot(self) -> tuple[str, int]:
+        with self._lock:
+            return self._best_text, self._best_samples
+
+    def _loop(self, run_id: int):
+        min_samples = int(PRECOMP_MIN_AUDIO * SAMPLE_RATE)
+        delta_samples = int(PRECOMP_MIN_DELTA * SAMPLE_RATE)
+        while self._active:
+            with self._lock:
+                if run_id != self._run_id:
+                    break
+            audio = self._recorder.peek()
+            n_samples = len(audio)
+            if n_samples < min_samples:
+                time.sleep(PRECOMP_IDLE_SLEEP)
+                continue
+            with self._lock:
+                last_requested = self._last_requested_samples
+            if n_samples < last_requested + delta_samples:
+                time.sleep(PRECOMP_IDLE_SLEEP)
+                continue
+
+            with self._lock:
+                self._last_requested_samples = n_samples
+                self._inflight = True
+
+            t0 = time.perf_counter()
+            try:
+                text = transcribe(audio, verbose=False)
+            except Exception as e:
+                log(f"[precompute] pass failed: {e}")
+                with self._lock:
+                    self._inflight = False
+                time.sleep(PRECOMP_IDLE_SLEEP)
+                continue
+            elapsed = time.perf_counter() - t0
+            with self._lock:
+                if n_samples >= self._best_samples:
+                    self._best_samples = n_samples
+                    self._best_text = text
+                self._inflight = False
+            log(f"[precompute] pass: {n_samples / SAMPLE_RATE:.1f}s -> {elapsed:.2f}s")
+            if not self._active:
+                break
+
+
+# ---------------------------------------------------------------------------
+# Text injection
+# ---------------------------------------------------------------------------
+
+def paste_text(text: str):
+    if not text.strip():
+        return
+    title = platform.get_foreground_window_title()
+    log(f"Injecting into {title!r}: {text!r}")
+    time.sleep(0.05)
+    platform.inject_text(text, log)
+    time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# Finalize helpers (one per output mode)
+# ---------------------------------------------------------------------------
+
+def _merge_text(base: str, tail: str) -> str:
+    """Merge base + tail transcripts with a simple overlap heuristic."""
+    base = base.strip()
+    tail = tail.strip()
+    if not base:
+        return tail
+    if not tail:
+        return base
+    if tail.startswith(base):
+        return tail
+    if base.endswith(tail):
+        return base
+
+    max_overlap = min(len(base), len(tail), 240)
+    overlap = 0
+    for k in range(max_overlap, 0, -1):
+        if base[-k:].lower() == tail[:k].lower():
+            overlap = k
+            break
+    if overlap > 0:
+        merged = base + tail[overlap:]
+        return merged.strip()
+    return f"{base} {tail}".strip()
+
+
+def _finish_one_shot(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
+                     t0: float, mode: str):
+    on_seg = None
+    if mode == "hybrid":
+        def on_seg(text: str):
+            overlay.show_processing(_wrap_preview(text))
+
+    try:
+        text = transcribe(audio, on_segment=on_seg)
+    except Exception as e:
+        log(f"Transcription error [{mode}]: {e}")
+        text = ""
+
+    elapsed = time.perf_counter() - t0
+    overlay.hide()
+    tray.set_state("idle")
+    if text:
+        text = _maybe_format_final_text(text, mode)
+        log(f"Done ({elapsed:.2f}s) [{mode}]: {text!r}")
+        paste_text(text)
+    else:
+        log(f"Nothing to paste ({elapsed:.2f}s) [{mode}].")
+
+
+def _finish_precompute(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
+                       t0: float, base_text: str, base_samples: int):
+    overlap_samples = int(PRECOMP_OVERLAP * SAMPLE_RATE)
+    total_samples = len(audio)
+    use_base = bool(base_text and base_samples > 0 and base_samples < total_samples)
+    if base_samples > 0:
+        lag = max(0.0, (total_samples - base_samples) / SAMPLE_RATE)
+        log(f"[precompute] snapshot lag: {lag:.2f}s")
+
+    try:
+        if use_base:
+            tail_start = max(0, base_samples - overlap_samples)
+            tail_audio = audio[tail_start:]
+            log(f"[precompute] base={base_samples / SAMPLE_RATE:.1f}s "
+                f"tail={len(tail_audio) / SAMPLE_RATE:.1f}s")
+            tail_text = transcribe(tail_audio)
+            text = _merge_text(base_text, tail_text)
+        else:
+            if base_text and base_samples >= total_samples:
+                log("[precompute] using full precomputed transcript.")
+                text = base_text
+            else:
+                log("[precompute] no usable base snapshot, falling back to full pass.")
+                text = transcribe(audio)
+    except Exception as e:
+        log(f"Transcription error [precompute]: {e}")
+        text = ""
+
+    elapsed = time.perf_counter() - t0
+    overlay.hide()
+    tray.set_state("idle")
+    if text:
+        text = _maybe_format_final_text(text, "precompute")
+        log(f"Done ({elapsed:.2f}s) [precompute]: {text!r}")
+        paste_text(text)
+    else:
+        log(f"Nothing to paste ({elapsed:.2f}s) [precompute].")
+
+
+def _finish_stabilized(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
+                       t0: float):
+    title = platform.get_foreground_window_title()
+    log(f"[stabilized] target: {title!r}")
+
+    injected_parts: list[str] = []
+    first_char_t: list[float | None] = [None]
+
+    def _commit(text: str):
+        prefix = " " if injected_parts else ""
+        if not injected_parts:
+            time.sleep(0.05)
+            first_char_t[0] = time.perf_counter()
+        platform.inject_text(prefix + text, log)
+        injected_parts.append(text)
+        overlay.show_processing(_wrap_preview(text))
+        log(f"[stabilized] commit: {text!r}")
+
+    def on_segment(text: str):
+        _commit(text)
+
+    try:
+        full_text = transcribe(audio, on_segment=on_segment)
+    except Exception as e:
+        log(f"Transcription error [stabilized]: {e}")
+        overlay.hide()
+        tray.set_state("idle")
+        log(f"Done (error) [stabilized].")
+        return
+
+    injected_text = " ".join(injected_parts)
+    if injected_text and injected_text != full_text:
+        log(f"[stabilized] tail correction needed: {injected_text!r} -> {full_text!r}")
+        common = 0
+        for a, b in zip(injected_text, full_text):
+            if a == b:
+                common += 1
+            else:
+                break
+        to_delete = len(injected_text) - common
+        tail      = full_text[common:]
+        log(f"[stabilized] delete {to_delete} chars, append {tail!r}")
+        if to_delete > 0:
+            platform.inject_backspaces(to_delete, log)
+            time.sleep(0.02)
+        if tail:
+            platform.inject_text(tail, log)
+
+    elapsed = time.perf_counter() - t0
+    overlay.hide()
+    tray.set_state("idle")
+    if first_char_t[0] is not None:
+        log(f"[stabilized] first char +{first_char_t[0] - t0:.2f}s, total {elapsed:.2f}s")
+    if full_text:
+        log(f"Done ({elapsed:.2f}s) [stabilized]: {full_text!r}")
+    else:
+        log(f"Nothing to paste ({elapsed:.2f}s) [stabilized].")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _meeting_transcribe(audio: np.ndarray) -> str:
+    """Transcription helper for meeting mode — uses the final model with current language."""
+    duration = len(audio) / SAMPLE_RATE
+    if duration < 0.3:
+        return ""
+    model = get_model()
+    lang = _settings.get("language", "en")
+    task = _settings.get("task", "transcribe")
+    segments, info = model.transcribe(
+        audio,
+        language=lang,
+        task=task,
+        vad_filter=True,
+        beam_size=1,
+        condition_on_previous_text=False,
+    )
+    parts = []
+    for seg in segments:
+        text = seg.text.strip()
+        if text:
+            parts.append(text)
+    result = _apply_corrections(" ".join(parts).strip())
+    return result
+
+
+def run():
+    global _meeting_recorder
+    _write_heartbeat()
+    _load_settings()
+    log(
+        "Settings: "
+        f"final_model={_settings['final_model']!r}  "
+        f"stream_model={_settings['stream_model']!r}  "
+        f"output_mode={_settings['output_mode']!r}  "
+        f"language={_settings.get('language')!r}  "
+        f"formatter_enabled={_settings['formatter_enabled']!r}  "
+        f"formatter_model={_settings['formatter_model']!r}"
+    )
+
+    recorder = Recorder()
+    overlay  = Overlay(get_level=recorder.get_rms)
+    streamer = StreamingTranscriber(recorder, overlay)
+    precomputer = FinalPrecomputer(recorder)
+
+    _meeting_recorder = MeetingRecorder(
+        get_model=get_model,
+        transcribe_fn=_meeting_transcribe,
+        log=log,
+        language_fn=lambda: _settings.get("language", "en"),
+        script_dir=_SCRIPT_DIR,
+    )
+
+    tray     = TrayIcon(overlay)
+    tray.start()
+    platform.setup_process()
+
+    def hotkey_worker():
+        # Load main model first, then stream model
+        threading.Thread(target=get_model, daemon=True).start()
+        threading.Thread(target=_load_stream_model, daemon=True).start()
+        if _settings.get("formatter_enabled", False):
+            def _warm_formatter_after_startup():
+                get_model()
+                _load_stream_model()
+                get_text_formatter()
+
+            threading.Thread(target=_warm_formatter_after_startup, daemon=True).start()
+        log("Ready. Hold Caps Lock to record.")
+
+        was_down = False
+        down_since = 0.0
+        forced_stop = False
+        last_heartbeat = 0.0
+        while True:
+            now = time.monotonic()
+            if now - last_heartbeat >= _HEARTBEAT_INTERVAL:
+                _write_heartbeat()
+                last_heartbeat = now
+
+            raw_down = platform.is_hotkey_down()
+            if not raw_down:
+                forced_stop = False
+            is_down = raw_down and not forced_stop
+
+            if is_down and was_down and time.monotonic() - down_since > MAX_RECORDING_SECONDS:
+                log(f"--- Recording exceeded {MAX_RECORDING_SECONDS}s safety cap; force-stopping ---")
+                forced_stop = True
+                is_down = False
+
+            if is_down and not was_down:
+                if not tray.enabled:
+                    pass  # silently ignore while disabled
+                else:
+                    log("--- Key DOWN ---")
+                    down_since = time.monotonic()
+                    platform.snapshot_target_app()
+                    tray.set_state("recording")
+                    overlay.show_rec()
+                    recorder.start()
+                    streamer.start()
+                    mode = _effective_output_mode()
+                    if mode == "precompute":
+                        precomputer.start()
+                    else:
+                        precomputer.stop()
+
+            elif not is_down and was_down:
+                if tray.enabled:
+                    log("--- Key UP ---")
+                    try:
+                        streamer.stop()
+                        audio = recorder.stop()
+                        mode = _effective_output_mode()
+                        if mode == "precompute":
+                            precomputer.stop(wait=PRECOMP_STOP_WAIT)
+                        else:
+                            precomputer.stop()
+                        pre_state = precomputer.snapshot()
+
+                        def _finish(audio=audio, preview=streamer.last_preview, pre_state=pre_state):
+                            mode = _effective_output_mode()
+                            overlay.show_processing(preview)
+                            tray.set_state("processing")
+                            t0 = time.perf_counter()
+                            log(f"Finalize mode: {mode!r}")
+                            if mode == "precompute":
+                                base_text, base_samples = pre_state
+                                _finish_precompute(audio, overlay, tray, t0, base_text, base_samples)
+                            elif mode == "stabilized":
+                                _finish_stabilized(audio, overlay, tray, t0)
+                            else:
+                                _finish_one_shot(audio, overlay, tray, t0, mode)
+
+                        threading.Thread(target=_finish, daemon=True).start()
+                    except Exception as e:
+                        log(f"Key-up handling error: {e}")
+                        import traceback; log(traceback.format_exc())
+                        overlay.hide()
+                        tray.set_state("idle")
+
+            was_down = is_down
+            time.sleep(POLL_INTERVAL)
+
+    threading.Thread(target=hotkey_worker, daemon=True).start()
+
+    # Tkinter mainloop MUST run on the main thread on Windows
+    overlay.mainloop()
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except KeyboardInterrupt:
+        sys.exit(0)
