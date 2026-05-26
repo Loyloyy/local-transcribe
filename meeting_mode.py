@@ -8,40 +8,12 @@ import threading
 import datetime
 
 import numpy as np
-import sounddevice as sd
 
 
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 30       # transcribe every N seconds
 OVERLAP_SECONDS = 5      # overlap between chunks for context continuity
 MIN_CHUNK_SECONDS = 3    # don't transcribe very short trailing chunks
-
-
-def find_loopback_device() -> int | None:
-    """Find a WASAPI loopback device index, or None if unavailable.
-
-    On Windows, sounddevice exposes WASAPI loopback devices with names
-    containing '(loopback)' when the WASAPI host API is available.
-    """
-    try:
-        devices = sd.query_devices()
-    except Exception:
-        return None
-
-    for idx, dev in enumerate(devices):
-        name = dev.get("name", "").lower()
-        if "(loopback)" in name and dev.get("max_input_channels", 0) > 0:
-            return idx
-
-    return None
-
-
-def loopback_device_name(device_index: int) -> str:
-    try:
-        info = sd.query_devices(device_index)
-        return info.get("name", f"device {device_index}")
-    except Exception:
-        return f"device {device_index}"
 
 
 class MeetingRecorder:
@@ -62,14 +34,19 @@ class MeetingRecorder:
         self._script_dir = script_dir
 
         self._active = False
+        self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._stream: sd.InputStream | None = None
-        self._device_index: int | None = None
+
+        # pyaudiowpatch state
+        self._pa_instance = None
+        self._pa_stream = None
 
         self._lock = threading.Lock()
         self._buffer: list[np.ndarray] = []
 
         self._transcript_path: str | None = None
+        self._dev_sr: int = SAMPLE_RATE
+        self._dev_channels: int = 2
 
     @property
     def active(self) -> bool:
@@ -84,16 +61,41 @@ class MeetingRecorder:
         if self._active:
             return self._transcript_path
 
-        device = find_loopback_device()
-        if device is None:
-            self._log("Meeting mode: no WASAPI loopback device found. "
-                      "Enable 'Stereo Mix' in Windows Sound settings or install "
-                      "a virtual audio cable.")
+        # Open loopback via pyaudiowpatch
+        try:
+            import pyaudiowpatch as pyaudio
+        except ImportError:
+            self._log("Meeting mode: pyaudiowpatch not installed. "
+                      "Install with: pip install pyaudiowpatch")
             return None
 
-        self._device_index = device
-        dev_name = loopback_device_name(device)
-        self._log(f"Meeting mode: using loopback device {device} ({dev_name})")
+        try:
+            p = pyaudio.PyAudio()
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_idx = wasapi_info["defaultOutputDevice"]
+            speakers = p.get_device_info_by_index(default_idx)
+
+            if not speakers.get("isLoopbackDevice", False):
+                for loopback in p.get_loopback_device_info_generator():
+                    if loopback["name"].startswith(speakers["name"]):
+                        speakers = loopback
+                        break
+
+            dev_name = speakers["name"]
+            dev_sr = int(speakers["defaultSampleRate"])
+            channels = speakers["maxInputChannels"]
+        except Exception as e:
+            self._log(f"Meeting mode: failed to find loopback device: {e}")
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            return None
+
+        self._dev_sr = dev_sr
+        self._dev_channels = channels
+
+        self._log(f"Meeting mode: using loopback {dev_name!r}  sr={dev_sr}  ch={channels}")
 
         # Create transcript file
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -106,30 +108,28 @@ class MeetingRecorder:
         with self._lock:
             self._buffer = []
 
+        self._stop_event.clear()
         self._active = True
 
-        # Query the device to get its native sample rate
-        dev_info = sd.query_devices(device)
-        dev_sr = int(dev_info.get("default_samplerate", SAMPLE_RATE))
-        channels = min(dev_info.get("max_input_channels", 2), 2)
-
-        self._dev_sr = dev_sr
-        self._dev_channels = channels
-
         try:
-            self._stream = sd.InputStream(
-                samplerate=dev_sr,
+            self._pa_stream = p.open(
+                format=pyaudio.paFloat32,
                 channels=channels,
-                dtype="float32",
-                device=device,
-                callback=self._audio_callback,
-                blocksize=1024,
+                rate=dev_sr,
+                frames_per_buffer=512,
+                input=True,
+                input_device_index=speakers["index"],
+                stream_callback=self._audio_callback,
             )
-            self._stream.start()
+            self._pa_instance = p
         except Exception as e:
             self._log(f"Meeting mode: failed to open loopback stream: {e}")
             self._active = False
             self._transcript_path = None
+            try:
+                p.terminate()
+            except Exception:
+                pass
             return None
 
         self._thread = threading.Thread(target=self._transcription_loop, daemon=True,
@@ -144,14 +144,22 @@ class MeetingRecorder:
         if not self._active:
             return
         self._active = False
+        self._stop_event.set()
 
-        if self._stream is not None:
+        if self._pa_stream is not None:
             try:
-                self._stream.stop()
-                self._stream.close()
+                self._pa_stream.stop_stream()
+                self._pa_stream.close()
             except Exception as e:
                 self._log(f"Meeting mode: stream close error: {e}")
-            self._stream = None
+            self._pa_stream = None
+
+        if self._pa_instance is not None:
+            try:
+                self._pa_instance.terminate()
+            except Exception:
+                pass
+            self._pa_instance = None
 
         if self._thread is not None:
             self._thread.join(timeout=5.0)
@@ -159,12 +167,14 @@ class MeetingRecorder:
 
         self._log("Meeting mode stopped.")
 
-    def _audio_callback(self, indata, frames, time_info, status):
-        if status:
-            self._log(f"Meeting audio status: {status}")
+    def _audio_callback(self, in_data, frame_count, time_info, status_flags):
+        import pyaudiowpatch as pyaudio
+        audio = np.frombuffer(in_data, dtype=np.float32)
+        audio = audio.reshape(-1, self._dev_channels)
         if self._active:
             with self._lock:
-                self._buffer.append(indata.copy())
+                self._buffer.append(audio.copy())
+        return (None, pyaudio.paContinue)
 
     def _get_audio_chunk(self, seconds: float) -> np.ndarray | None:
         """Extract up to `seconds` worth of audio from the buffer, consuming older data."""
@@ -195,9 +205,10 @@ class MeetingRecorder:
 
         # Resample to 16kHz if device sample rate differs
         if self._dev_sr != SAMPLE_RATE:
-            import scipy.signal
-            num_samples = int(len(chunk) * SAMPLE_RATE / self._dev_sr)
-            chunk = scipy.signal.resample(chunk, num_samples).astype(np.float32)
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(SAMPLE_RATE, self._dev_sr)
+            chunk = resample_poly(chunk, SAMPLE_RATE // g, self._dev_sr // g).astype(np.float32)
 
         return chunk
 
@@ -214,7 +225,8 @@ class MeetingRecorder:
         self._log("Meeting mode: model ready, transcription loop starting.")
 
         while self._active:
-            time.sleep(CHUNK_SECONDS)
+            # Use event wait instead of sleep so stop() is instant
+            self._stop_event.wait(CHUNK_SECONDS)
             if not self._active:
                 break
 

@@ -14,6 +14,7 @@ voice-type.log
 voice-type.instance.lock
 voice-type.heartbeat
 settings.json
+meeting_*.txt
 
 # Environment
 .env

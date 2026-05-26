@@ -18,8 +18,8 @@ Adapted from https://github.com/mikecann/mikerosoft (voice-type and transcribe t
 
 - Python 3.11 (Windows)
 - faster-whisper — local Whisper transcription (no API)
-- sounddevice — mic and system audio capture
-- pyaudiowpatch — WASAPI loopback capture for system audio in push-to-talk mode
+- sounddevice — microphone capture
+- pyaudiowpatch — WASAPI loopback capture for system audio (used in both push-to-talk loopback mode and meeting mode)
 - scipy — audio resampling (loopback devices use native sample rates)
 - pystray + Pillow — system tray icon
 - tkinter — overlay UI
@@ -27,14 +27,12 @@ Adapted from https://github.com/mikecann/mikerosoft (voice-type and transcribe t
 
 ## Key Files
 
-- `voice-type.py` — main entry point, hotkey loop, overlay, tray, settings UI
+- `voice-type.py` — main entry point, hotkey loop, overlay, tray, settings UI, cancellation mechanism
 - `platform_win.py` — Windows-specific audio, keyboard injection, hotkey
-- `meeting_mode.py` — WASAPI loopback capture, rolling transcript writer
-- `speech_backends.py` — MLX/faster-whisper model abstraction
+- `meeting_mode.py` — WASAPI loopback capture, rolling transcript writer (uses pyaudiowpatch)
 - `text_formatter.py` — LLM-based text cleanup (disabled by default, needs llama-cpp-python)
 - `preview_format.py` — overlay preview text wrapping
 - `runtime_policy.py` — per-platform mic stream policy
-- `voice_type_control.py` — Unix-socket control server (macOS only, unused on Windows)
 - `settings.json` — persisted user settings (model, language, audio source, corrections, etc.)
 - `start.bat` — double-click to launch
 
@@ -46,26 +44,46 @@ The `Recorder` class in `voice-type.py` supports two backends:
 
 The stream is reopened automatically when the audio source setting changes (detected in `_ensure_stream()`). `sounddevice` does not enumerate WASAPI loopback devices on most Windows systems, so `pyaudiowpatch` is the primary loopback backend.
 
+## GPU Support
+
+CUDA GPU acceleration is detected automatically via `platform.cuda_available()`. Both the final model and stream model attempt GPU loading first, with automatic CPU fallback:
+
+1. Try loading the model on CUDA with float16 compute type
+2. Run a warm-up inference to verify the GPU actually works (catches missing DLLs)
+3. If anything fails, log the error and fall back to CPU with int8 quantization
+
+To enable GPU acceleration, install PyTorch with CUDA support:
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+```
+Match the CUDA toolkit version to your system (cu118, cu121, cu124, etc.).
+
 ## Hotkey
 
 Caps Lock (0x14) — hold to record, release to transcribe and type.
 
+## Cancellation Mechanism
+
+In-flight transcriptions can be cancelled by pressing the hotkey again (starting a new recording). The mechanism:
+- `_finalize_cancel` (`threading.Event`) tracks the current finalize pass
+- On key-down: any existing cancel event is set, aborting the previous transcription
+- On key-up: a fresh event is created and passed to the finalize thread
+- `transcribe()` checks `cancel_event.is_set()` between segments
+- `_transcribe_with_timeout()` wraps transcription in a 60-second timeout
+
 ## Translation Mode
 
-A "Task" setting (`transcribe` / `translate`) is exposed in the tray menu and `settings.json`. It passes `task=` to `model.transcribe()`. However:
+A "Task" setting (`transcribe` / `translate`) is exposed in the tray menu and `settings.json`. It passes `task=` to `model.transcribe()`.
 
-- **`large-v3-turbo` does NOT reliably translate** — it ignores the `task="translate"` parameter and outputs the original language. This appears to be a model limitation (distilled for transcription only).
-- `large-v3` on CPU with int8 is very slow and also produced gibberish in testing.
-- **TODO**: find a model/configuration that reliably translates. Options to investigate:
-  - `large-v3` on GPU (float16) — may work once GPU is running
-  - `large-v2` — older but known to support translation
-  - Increase `beam_size` for translate task (greedy decoding may hurt translation)
+- **`large-v3` works** for translation (tested on GPU with float16)
+- **`large-v3-turbo` does NOT reliably translate** — it ignores the `task="translate"` parameter and outputs the original language (distilled for transcription only)
+- `large-v2` also supports translation
+- English-only models (`.en` suffix) cannot translate; the stream model auto-overrides to `lang="en"` + `task="transcribe"` when a `.en` model is used with a non-English language setting
 
 ## Known Issues / TODOs
 
-- **Cancel/stop transcription**: there is currently no way to abort a transcription in progress (e.g. if you accidentally hold Caps Lock too long). Need a mechanism to cancel.
-- **GPU not working**: `ctranslate2` detects 1 CUDA device, but faster-whisper may fail to load on GPU if cuBLAS/cuDNN DLLs are missing from PATH. The `cublas64_12.dll` check was removed but GPU loading may still error at runtime. Need to test and fix.
-- **Translation not working**: see Translation Mode section above.
+- **Translation model selection**: `large-v3-turbo` doesn't translate. Users must manually switch to `large-v3` or `large-v2` for translation. Consider auto-switching or adding a warning.
+- **Stabilized mode + cancellation**: if cancelled mid-injection, partial text may remain in the target window.
 
 ## Git Workflow
 
@@ -75,8 +93,8 @@ A "Task" setting (`transcribe` / `translate`) is exposed in the tray menu and `s
 - `voice-type.log` — runtime log (contains local device names, transcription output)
 - `voice-type.instance.lock` — runtime lock file
 - `voice-type.heartbeat` — runtime heartbeat file
-- `settings.json` — contains user-specific device/model preferences (ship a `settings.example.json` instead if needed)
-- `*.egg-info/`, `dist/`, `build/` — packaging artifacts
+- `settings.json` — contains user-specific device/model preferences
+- `meeting_*.txt` — meeting mode transcript files
 - `.env` — if ever added
 
 ### Sensitive information review:
@@ -88,9 +106,9 @@ A "Task" setting (`transcribe` / `translate`) is exposed in the tray menu and `s
 ```bash
 # 1. Create .gitignore first (see above)
 # 2. Stage source files only
-git add voice-type.py platform_win.py meeting_mode.py speech_backends.py \
-        text_formatter.py preview_format.py runtime_policy.py voice_type_control.py \
-        list_devices.py start.bat icons/ CLAUDE.md DEV_NOTES.md README.md
+git add voice-type.py platform_win.py meeting_mode.py \
+        text_formatter.py preview_format.py runtime_policy.py \
+        list_devices.py start.bat icons/ CLAUDE.md DEV_NOTES.md README.md .gitignore
 
 # 3. Commit
 git commit -m "description of changes"

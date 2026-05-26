@@ -147,7 +147,6 @@ import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from runtime_policy import should_keep_mic_stream_open_local
-from speech_backends import MlxWhisperModel, resolve_local_mlx_repo
 from text_formatter import (
     DEFAULT_FORMATTER_MODEL,
     DEFAULT_FORMATTER_SYSTEM_PROMPT,
@@ -157,8 +156,7 @@ from text_formatter import (
     resolve_system_prompt,
 )
 from preview_format import wrap_preview
-from voice_type_control import ControlServer
-from meeting_mode import MeetingRecorder, find_loopback_device
+from meeting_mode import MeetingRecorder
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -302,13 +300,28 @@ def _apply_corrections(text: str) -> str:
 _model = None
 _model_lock = threading.Lock()
 
+# Cancel state for in-flight transcriptions
+_finalize_cancel: threading.Event | None = None
+_finalize_lock = threading.Lock()
+
+TRANSCRIBE_TIMEOUT = 60  # seconds — abandon a stuck transcription after this
+
 
 def _load_faster_whisper_model(name: str):
     cuda = platform.cuda_available()
-    device = "cuda" if cuda else "cpu"
-    ct = COMPUTE_TYPE if cuda else "int8"
-    log(f"Loading final model {name!r} on {device} ({ct})...")
-    return WhisperModel(name, device=device, compute_type=ct)
+    if cuda:
+        try:
+            log(f"Loading final model {name!r} on cuda ({COMPUTE_TYPE})...")
+            model = WhisperModel(name, device="cuda", compute_type=COMPUTE_TYPE)
+            # Run a quick inference to verify GPU actually works (catches missing DLLs)
+            import numpy as _np
+            _silence = _np.zeros(16000, dtype=_np.float32)
+            list(model.transcribe(_silence, language="en", vad_filter=False, beam_size=1)[0])
+            return model
+        except Exception as e:
+            log(f"CUDA inference failed ({e}), falling back to CPU.")
+    log(f"Loading final model {name!r} on cpu (int8)...")
+    return WhisperModel(name, device="cpu", compute_type="int8")
 
 
 def get_model():
@@ -317,19 +330,6 @@ def get_model():
         with _model_lock:
             if _model is None:
                 name = _settings.get("final_model", CPU_MODEL)
-
-                mlx_repo = resolve_local_mlx_repo(model_name=name)
-                if mlx_repo:
-                    try:
-                        log(f"Loading final model {name!r} on mlx ({mlx_repo})...")
-                        mlx_model = MlxWhisperModel(repo_id=mlx_repo)
-                        mlx_model.warm()
-                        _model = mlx_model
-                        log("Final model ready.")
-                        return _model
-                    except Exception as e:
-                        log(f"MLX load failed for {name!r}: {e}. Falling back to faster-whisper.")
-
                 _model = _load_faster_whisper_model(name)
                 log("Final model ready.")
     return _model
@@ -351,12 +351,22 @@ def _load_stream_model():
     get_model()   # ensure final model finishes first
     with _stream_model_lock:
         if _stream_model is None:
-            cuda   = platform.cuda_available()
-            name   = _settings.get("stream_model", STREAM_MODEL)
-            device = "cuda" if cuda else "cpu"
-            ct     = COMPUTE_TYPE if cuda else "int8"
-            log(f"Loading stream model {name!r} on {device} ({ct})...")
-            _stream_model = WhisperModel(name, device=device, compute_type=ct)
+            name = _settings.get("stream_model", STREAM_MODEL)
+            cuda = platform.cuda_available()
+            if cuda:
+                try:
+                    log(f"Loading stream model {name!r} on cuda ({COMPUTE_TYPE})...")
+                    m = WhisperModel(name, device="cuda", compute_type=COMPUTE_TYPE)
+                    import numpy as _np
+                    _silence = _np.zeros(16000, dtype=_np.float32)
+                    list(m.transcribe(_silence, language="en", vad_filter=False, beam_size=1)[0])
+                    _stream_model = m
+                    log("Stream model ready.")
+                    return
+                except Exception as e:
+                    log(f"Stream model CUDA failed ({e}), falling back to CPU.")
+            log(f"Loading stream model {name!r} on cpu (int8)...")
+            _stream_model = WhisperModel(name, device="cpu", compute_type="int8")
             log("Stream model ready.")
 
 
@@ -1512,33 +1522,12 @@ class Recorder:
         source = _settings.get("audio_source", "mic")
         self._opened_source = source
         if source == "loopback":
-            # Try sounddevice loopback devices first, then pyaudiowpatch
-            dev_idx = find_loopback_device()
-            if dev_idx is not None:
-                self._open_sd_loopback_stream(dev_idx)
-                return
             if self._try_open_pyaudio_loopback():
                 return
             log("Loopback not available. Install pyaudiowpatch: pip install pyaudiowpatch")
             self._open_mic_stream()
         else:
             self._open_mic_stream()
-
-    def _open_sd_loopback_stream(self, dev_idx: int):
-        """Open a sounddevice loopback stream (for systems that enumerate loopback devices)."""
-        dev_info = sd.query_devices(dev_idx)
-        dev_name = dev_info.get("name", f"device {dev_idx}")
-        dev_sr = int(dev_info.get("default_samplerate", SAMPLE_RATE))
-        channels = min(dev_info.get("max_input_channels", 2), 2)
-        log(f"Loopback (sd): {dev_name!r}  sr={dev_sr}  ch={channels}")
-        self._dev_sr = dev_sr
-        self._dev_channels = channels
-        self._using_loopback = True
-        self._stream = sd.InputStream(
-            samplerate=dev_sr, channels=channels, dtype=DTYPE,
-            device=dev_idx, callback=self._callback, blocksize=1024,
-        )
-        self._stream.start()
 
     def _try_open_pyaudio_loopback(self) -> bool:
         """Try WASAPI loopback via pyaudiowpatch. Returns True on success."""
@@ -1761,8 +1750,13 @@ class Recorder:
 # Transcription
 # ---------------------------------------------------------------------------
 
-def transcribe(audio: np.ndarray, verbose: bool = True, on_segment=None) -> str:
-    """Transcribe audio using the final model."""
+def transcribe(audio: np.ndarray, verbose: bool = True, on_segment=None,
+               cancel_event: threading.Event | None = None) -> str:
+    """Transcribe audio using the final model.
+
+    If *cancel_event* is set between segments the transcription is abandoned
+    and an empty string is returned.
+    """
     duration = len(audio) / SAMPLE_RATE
     if duration < 0.3:
         return ""
@@ -1781,6 +1775,9 @@ def transcribe(audio: np.ndarray, verbose: bool = True, on_segment=None) -> str:
     )
     parts = []
     for seg in segments:
+        if cancel_event is not None and cancel_event.is_set():
+            log("Transcription cancelled between segments.")
+            return ""
         text = seg.text.strip()
         if text:
             parts.append(text)
@@ -1791,6 +1788,29 @@ def transcribe(audio: np.ndarray, verbose: bool = True, on_segment=None) -> str:
         log(f"Transcribed {duration:.1f}s -> {result!r}  "
             f"(lang={info.language} p={info.language_probability:.2f})")
     return result
+
+
+def _transcribe_with_timeout(audio: np.ndarray, cancel_event: threading.Event,
+                             verbose: bool = True, on_segment=None) -> str:
+    """Run transcribe() in a daemon thread with a timeout.
+
+    If the transcription doesn't finish within TRANSCRIBE_TIMEOUT seconds,
+    the cancel event is set and an empty string is returned.
+    """
+    result_box: list[str] = [""]
+
+    def _worker():
+        result_box[0] = transcribe(audio, verbose=verbose, on_segment=on_segment,
+                                   cancel_event=cancel_event)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=TRANSCRIBE_TIMEOUT)
+    if t.is_alive():
+        log(f"Transcription timed out after {TRANSCRIBE_TIMEOUT}s, cancelling.")
+        cancel_event.set()
+        return ""
+    return result_box[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1833,11 +1853,21 @@ class StreamingTranscriber:
                 t0 = time.perf_counter()
                 lang = _settings.get("language", "en")
                 task = _settings.get("task", "transcribe")
-                segs, _ = model.transcribe(
-                    audio, language=lang, task=task, vad_filter=False,
-                    beam_size=1, condition_on_previous_text=False,
-                )
-                text = " ".join(s.text.strip() for s in segs).strip()
+                # English-only models (.en) cannot accept other languages
+                stream_name = _settings.get("stream_model", STREAM_MODEL)
+                if stream_name.endswith(".en") and lang and lang != "en":
+                    lang = "en"
+                    task = "transcribe"
+                try:
+                    segs, _ = model.transcribe(
+                        audio, language=lang, task=task, vad_filter=False,
+                        beam_size=1, condition_on_previous_text=False,
+                    )
+                    text = " ".join(s.text.strip() for s in segs).strip()
+                except Exception as e:
+                    log(f"Stream pass error: {e}")
+                    time.sleep(STREAM_INTERVAL)
+                    continue
                 if not self._active:
                     break
                 elapsed = time.perf_counter() - t0
@@ -1970,14 +2000,18 @@ def _merge_text(base: str, tail: str) -> str:
 
 
 def _finish_one_shot(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
-                     t0: float, mode: str):
+                     t0: float, mode: str,
+                     cancel_event: threading.Event | None = None):
     on_seg = None
     if mode == "hybrid":
         def on_seg(text: str):
             overlay.show_processing(_wrap_preview(text))
 
     try:
-        text = transcribe(audio, on_segment=on_seg)
+        if cancel_event is not None:
+            text = _transcribe_with_timeout(audio, cancel_event, on_segment=on_seg)
+        else:
+            text = transcribe(audio, on_segment=on_seg)
     except Exception as e:
         log(f"Transcription error [{mode}]: {e}")
         text = ""
@@ -1985,6 +2019,9 @@ def _finish_one_shot(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
     elapsed = time.perf_counter() - t0
     overlay.hide()
     tray.set_state("idle")
+    if cancel_event is not None and cancel_event.is_set():
+        log(f"Cancelled ({elapsed:.2f}s) [{mode}].")
+        return
     if text:
         text = _maybe_format_final_text(text, mode)
         log(f"Done ({elapsed:.2f}s) [{mode}]: {text!r}")
@@ -1994,7 +2031,8 @@ def _finish_one_shot(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
 
 
 def _finish_precompute(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
-                       t0: float, base_text: str, base_samples: int):
+                       t0: float, base_text: str, base_samples: int,
+                       cancel_event: threading.Event | None = None):
     overlap_samples = int(PRECOMP_OVERLAP * SAMPLE_RATE)
     total_samples = len(audio)
     use_base = bool(base_text and base_samples > 0 and base_samples < total_samples)
@@ -2008,7 +2046,10 @@ def _finish_precompute(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
             tail_audio = audio[tail_start:]
             log(f"[precompute] base={base_samples / SAMPLE_RATE:.1f}s "
                 f"tail={len(tail_audio) / SAMPLE_RATE:.1f}s")
-            tail_text = transcribe(tail_audio)
+            if cancel_event is not None:
+                tail_text = _transcribe_with_timeout(tail_audio, cancel_event)
+            else:
+                tail_text = transcribe(tail_audio)
             text = _merge_text(base_text, tail_text)
         else:
             if base_text and base_samples >= total_samples:
@@ -2016,7 +2057,10 @@ def _finish_precompute(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
                 text = base_text
             else:
                 log("[precompute] no usable base snapshot, falling back to full pass.")
-                text = transcribe(audio)
+                if cancel_event is not None:
+                    text = _transcribe_with_timeout(audio, cancel_event)
+                else:
+                    text = transcribe(audio)
     except Exception as e:
         log(f"Transcription error [precompute]: {e}")
         text = ""
@@ -2024,6 +2068,9 @@ def _finish_precompute(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
     elapsed = time.perf_counter() - t0
     overlay.hide()
     tray.set_state("idle")
+    if cancel_event is not None and cancel_event.is_set():
+        log(f"Cancelled ({elapsed:.2f}s) [precompute].")
+        return
     if text:
         text = _maybe_format_final_text(text, "precompute")
         log(f"Done ({elapsed:.2f}s) [precompute]: {text!r}")
@@ -2033,7 +2080,8 @@ def _finish_precompute(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
 
 
 def _finish_stabilized(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
-                       t0: float):
+                       t0: float,
+                       cancel_event: threading.Event | None = None):
     title = platform.get_foreground_window_title()
     log(f"[stabilized] target: {title!r}")
 
@@ -2054,12 +2102,23 @@ def _finish_stabilized(audio: np.ndarray, overlay: "Overlay", tray: "TrayIcon",
         _commit(text)
 
     try:
-        full_text = transcribe(audio, on_segment=on_segment)
+        if cancel_event is not None:
+            full_text = _transcribe_with_timeout(audio, cancel_event,
+                                                 on_segment=on_segment)
+        else:
+            full_text = transcribe(audio, on_segment=on_segment)
     except Exception as e:
         log(f"Transcription error [stabilized]: {e}")
         overlay.hide()
         tray.set_state("idle")
         log(f"Done (error) [stabilized].")
+        return
+
+    if cancel_event is not None and cancel_event.is_set():
+        elapsed = time.perf_counter() - t0
+        overlay.hide()
+        tray.set_state("idle")
+        log(f"Cancelled ({elapsed:.2f}s) [stabilized].")
         return
 
     injected_text = " ".join(injected_parts)
@@ -2164,6 +2223,7 @@ def run():
             threading.Thread(target=_warm_formatter_after_startup, daemon=True).start()
         log("Ready. Hold Caps Lock to record.")
 
+        global _finalize_cancel
         was_down = False
         down_since = 0.0
         forced_stop = False
@@ -2188,6 +2248,12 @@ def run():
                 if not tray.enabled:
                     pass  # silently ignore while disabled
                 else:
+                    # Cancel any in-flight transcription from a previous press
+                    with _finalize_lock:
+                        if _finalize_cancel is not None:
+                            _finalize_cancel.set()
+                            log("Cancelled in-flight transcription.")
+
                     log("--- Key DOWN ---")
                     down_since = time.monotonic()
                     platform.snapshot_target_app()
@@ -2214,7 +2280,13 @@ def run():
                             precomputer.stop()
                         pre_state = precomputer.snapshot()
 
-                        def _finish(audio=audio, preview=streamer.last_preview, pre_state=pre_state):
+                        # Create a new cancel event for this finalize pass
+                        cancel_ev = threading.Event()
+                        with _finalize_lock:
+                            _finalize_cancel = cancel_ev
+
+                        def _finish(audio=audio, preview=streamer.last_preview,
+                                    pre_state=pre_state, cancel_event=cancel_ev):
                             mode = _effective_output_mode()
                             overlay.show_processing(preview)
                             tray.set_state("processing")
@@ -2222,11 +2294,15 @@ def run():
                             log(f"Finalize mode: {mode!r}")
                             if mode == "precompute":
                                 base_text, base_samples = pre_state
-                                _finish_precompute(audio, overlay, tray, t0, base_text, base_samples)
+                                _finish_precompute(audio, overlay, tray, t0,
+                                                   base_text, base_samples,
+                                                   cancel_event=cancel_event)
                             elif mode == "stabilized":
-                                _finish_stabilized(audio, overlay, tray, t0)
+                                _finish_stabilized(audio, overlay, tray, t0,
+                                                   cancel_event=cancel_event)
                             else:
-                                _finish_one_shot(audio, overlay, tray, t0, mode)
+                                _finish_one_shot(audio, overlay, tray, t0, mode,
+                                                 cancel_event=cancel_event)
 
                         threading.Thread(target=_finish, daemon=True).start()
                     except Exception as e:
