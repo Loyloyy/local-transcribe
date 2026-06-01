@@ -105,3 +105,15 @@ All settings are stored in `settings.json` next to the script:
 | `language` | `en` | Language code or `null` for auto-detect |
 | `task` | `transcribe` | `transcribe` or `translate` (translate outputs English) |
 | `corrections` | `{}` | Word/phrase corrections applied after transcription |
+
+## AI agent compatibility
+
+Project instructions follow the [`AGENTS.md`](https://agents.md/) open standard, so the
+codebase can be developed from any AI coding tool:
+
+- **OpenAI Codex, Cursor, Copilot, Windsurf** — read `AGENTS.md` natively.
+- **Claude Code** — reads `CLAUDE.md`, a thin bridge that imports `AGENTS.md`.
+- **Gemini** — reads `GEMINI.md`, which imports `AGENTS.md`.
+- **Cursor** — also picks up `.cursor/rules/agents.mdc`.
+
+`AGENTS.md` is the single source of truth; the others are thin pointers, so the rules never drift.

@@ -1,0 +1,10 @@
+---
+description: Project instructions for Local Transcribe
+alwaysApply: true
+---
+
+The full developer guide for this project lives in `AGENTS.md` at the repo root:
+tech stack, key files, audio-source switching, GPU fallback, translation-mode
+gotchas, and the git workflow. Read it before editing.
+
+@AGENTS.md
